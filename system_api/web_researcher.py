@@ -4,7 +4,12 @@ Accepts an external LLM and provides paper search functionality
 """
 
 import re
-from langchain_community.tools import DuckDuckGoSearchResults
+try:
+    from ddgs import DDGS
+    DDGS_AVAILABLE = True
+except ImportError:
+    DDGS_AVAILABLE = False
+    print("Warning: ddgs package not available. Web search will be disabled.")
 
 # Regex patterns for parsing LLM output
 DATE_RE = re.compile(r'([A-Z][a-z]{2} \d{1,2}, \d{4})\s*·')
@@ -126,16 +131,38 @@ class WebSearcher:
         Returns:
             Formatted string with paper titles and links
         """
-        # Enhance query with academic sources
-        enhanced_query = (
-            f"{query} site:arxiv.org OR site:scholar.google.com OR "
-            f"site:pubmed.ncbi.nlm.nih.gov OR filetype:pdf research paper"
-        )
+        if not DDGS_AVAILABLE:
+            return "Web search is not available. Please install ddgs package."
         
-        search = DuckDuckGoSearchResults(num_results=10)
-        results = search.run(enhanced_query)
+        try:
+            # Use DDGS API directly
+            with DDGS() as ddgs:
+                # Try academic sources first
+                academic_query = (
+                    f"{query} site:arxiv.org OR site:scholar.google.com OR "
+                    f"site:pubmed.ncbi.nlm.nih.gov OR filetype:pdf"
+                )
+                search_results = list(ddgs.text(academic_query, max_results=10))
+                
+                # If no academic results, try broader search
+                if not search_results:
+                    search_results = list(ddgs.text(f"{query} research paper AI", max_results=10))
+            
+            if not search_results:
+                return "No papers found. Try refining your search query."
+            
+            # Format results as string for LLM
+            results = ""
+            for idx, result in enumerate(search_results, 1):
+                title = result.get('title', 'No title')
+                link = result.get('href', result.get('link', 'No link'))
+                snippet = result.get('body', result.get('snippet', 'No description'))
+                results += f"[{idx}] Title: {title}\nLink: {link}\nSnippet: {snippet}\n\n"
+            
+        except Exception as e:
+            return f"Search error: {str(e)}. Try refining your search query."
         
-        if not results or results == "No good DuckDuckGo Search Result was found":
+        if not results:
             return "No papers found. Try refining your search query."
         
         # Organize with LLM

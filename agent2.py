@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, Response
 from langchain_ollama import OllamaLLM
 from langchain_core.tools import Tool
 from langchain_classic.agents import AgentExecutor, create_react_agent
@@ -195,7 +195,8 @@ Thought:{agent_scratchpad}"""
             tools=tools,
             verbose=True,
             handle_parsing_errors=True,
-            max_iterations=1,
+            max_iterations=5,  # Allow multiple tool calls and reasoning steps
+            max_execution_time=60,  # Maximum 60 seconds per query
             return_intermediate_steps=True
         )
         logger.info("Agent created successfully")
@@ -239,6 +240,194 @@ def health():
             'message': ', '.join(message),
             'details': status_info
         }), 200
+
+@app.route('/query_stream', methods=['POST'])
+def query_stream():
+    """Streaming endpoint for real-time Agent + LLM responses with reasoning process"""
+    import queue
+    import threading
+    from system_api.agent_callbacks import AgentStreamCallback
+    
+    try:
+        user_input = request.json.get('input', '')
+        
+        if not user_input:
+            return jsonify({'error': 'No input provided'}), 400
+        
+        logger.info(f"Processing streaming query with agent: {user_input}")
+        
+        # Check for agent format in input (avoid loops)
+        user_input_lower = user_input.lower()
+        if all(keyword in user_input_lower for keyword in ['question:', 'thought:', 'action:']):
+            logger.warning("Detected agent format, using direct RAG")
+            use_agent = False
+        elif not agent_executor:
+            logger.warning("Agent not available, using direct RAG")
+            use_agent = False
+        else:
+            use_agent = True
+        
+        def generate():
+            try:
+                if not use_agent:
+                    # Direct RAG streaming (no agent)
+                    yield f"data: {json.dumps({'type': 'start', 'action': 'DirectRAG'})}\n\n"
+                    
+                    if rag_system:
+                        for chunk in rag_system.query_stream(user_input):
+                            if chunk:
+                                yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
+                    else:
+                        yield f"data: {json.dumps({'type': 'error', 'message': 'RAG system not available'})}\n\n"
+                    
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    return
+                
+                # Use Agent with streaming callbacks
+                event_queue = queue.Queue()
+                stop_event = threading.Event()  # Signal to stop agent execution
+                callback = AgentStreamCallback(event_queue, stop_event)
+                
+                # Run agent in a separate thread
+                def run_agent():
+                    try:
+                        agent_executor.invoke(
+                            {"input": user_input},
+                            config={"callbacks": [callback]}
+                        )
+                        # Signal completion
+                        event_queue.put({'type': 'agent_done'})
+                    except Exception as e:
+                        if stop_event.is_set():
+                            logger.info(f"Agent execution stopped by user")
+                            event_queue.put({'type': 'stopped'})
+                        else:
+                            logger.error(f"Agent execution error: {e}")
+                            event_queue.put({'type': 'error', 'content': str(e)})
+                
+                agent_thread = threading.Thread(target=run_agent, daemon=True)
+                agent_thread.start()
+                
+                # Send initial metadata
+                yield f"data: {json.dumps({'type': 'start', 'mode': 'agent'})}\n\n"
+                
+                # Stream events from queue
+                final_answer_started = False
+                final_answer_buffer = ""
+                
+                while True:
+                    try:
+                        # Wait for events with timeout
+                        event = event_queue.get(timeout=0.1)
+                        
+                        if event['type'] == 'agent_done':
+                            # Agent finished, send final answer if we have buffer
+                            if final_answer_buffer and not final_answer_started:
+                                yield f"data: {json.dumps({'type': 'final_answer', 'content': final_answer_buffer})}\n\n"
+                            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                            break
+                        
+                        elif event['type'] == 'thought':
+                            yield f"data: {json.dumps(event)}\n\n"
+                        
+                        elif event['type'] == 'action':
+                            yield f"data: {json.dumps(event)}\n\n"
+                            
+                            # If action is AssistantCall, start streaming the RAG output
+                            if event['tool'] == 'AssistantCall' and rag_system:
+                                try:
+                                    yield f"data: {json.dumps({'type': 'tool_start', 'tool': 'AssistantCall'})}\n\n"
+                                    
+                                    action_input = event.get('input', user_input)
+                                    rag_stream = rag_system.query_stream(action_input)
+                                    
+                                    for chunk in rag_stream:
+                                        # Check stop signal during RAG streaming
+                                        if stop_event.is_set():
+                                            logger.info("Stop signal detected during RAG streaming")
+                                            # Try to close the generator
+                                            try:
+                                                rag_stream.close()
+                                            except:
+                                                pass
+                                            break
+                                        if chunk:
+                                            yield f"data: {json.dumps({'type': 'tool_token', 'tool': 'AssistantCall', 'content': chunk})}\n\n"
+                                            final_answer_buffer += chunk
+                                    
+                                    final_answer_started = True
+                                except GeneratorExit:
+                                    # Client disconnected during RAG streaming
+                                    logger.info("Client disconnected during RAG streaming")
+                                    stop_event.set()
+                                    # Try to close the RAG stream
+                                    try:
+                                        if 'rag_stream' in locals():
+                                            rag_stream.close()
+                                    except:
+                                        pass
+                                    raise
+                        
+                        elif event['type'] == 'observation':
+                            # Skip observation if we already streamed the tool output
+                            if not final_answer_started:
+                                yield f"data: {json.dumps(event)}\n\n"
+                        
+                        elif event['type'] == 'final_answer':
+                            if not final_answer_started:
+                                # Stream final answer character by character if not already streamed
+                                content = event.get('content', '')
+                                for char in content:
+                                    yield f"data: {json.dumps({'type': 'chunk', 'content': char})}\n\n"
+                            else:
+                                # Already streamed via tool, just signal completion
+                                pass
+                        
+                        elif event['type'] == 'stopped':
+                            # Agent was stopped by user
+                            yield f"data: {json.dumps({'type': 'stopped'})}\n\n"
+                            break
+                        
+                        elif event['type'] == 'error':
+                            yield f"data: {json.dumps(event)}\n\n"
+                            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                            break
+                        
+                        else:
+                            # Forward other event types
+                            yield f"data: {json.dumps(event)}\n\n"
+                    
+                    except queue.Empty:
+                        # Check if thread is still alive
+                        if not agent_thread.is_alive():
+                            # Thread died without sending agent_done
+                            logger.warning("Agent thread died unexpectedly")
+                            if final_answer_buffer:
+                                yield f"data: {json.dumps({'type': 'final_answer', 'content': final_answer_buffer})}\n\n"
+                            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                            break
+                        continue
+                
+                # Wait for thread to complete
+                agent_thread.join(timeout=5)
+                
+            except GeneratorExit:
+                # Client disconnected, signal the agent to stop
+                logger.info("Client disconnected, stopping agent...")
+                if 'stop_event' in locals():
+                    stop_event.set()
+                raise  # Re-raise to properly close the generator
+            except Exception as e:
+                logger.error(f"Error in streaming: {e}", exc_info=True)
+                if 'stop_event' in locals():
+                    stop_event.set()
+                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        
+        return Response(generate(), mimetype='text/event-stream')
+        
+    except Exception as e:
+        logger.error(f"Error in query_stream: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/query', methods=['POST'])
 def query():

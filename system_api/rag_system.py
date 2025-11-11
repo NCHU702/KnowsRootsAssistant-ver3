@@ -694,6 +694,73 @@ class AcademicRAGSystem:
             logger.error(f"Error in RAG query: {e}", exc_info=True)
             return f"Error processing query: {str(e)}"
     
+    def query_stream(self, user_input: str):
+        """
+        Query the RAG system with streaming output
+        
+        Args:
+            user_input: User's question or query
+            
+        Yields:
+            Chunks of the response as they are generated
+        """
+        if not self.vectorstore:
+            yield "RAG system not properly initialized. Please check the logs."
+            return
+        
+        try:
+            logger.info(f"Processing RAG query (streaming): {user_input}")
+            
+            # Retrieve relevant documents
+            source_docs = self.vectorstore.similarity_search(user_input, k=self.k_documents)
+            
+            if not source_docs:
+                yield "No relevant documents found in the database."
+                return
+            
+            # Build context from retrieved documents
+            context = "\n\n".join([
+                f"文件 {i+1} ({doc.metadata.get('source_file', 'Unknown')}):\n{doc.page_content}"
+                for i, doc in enumerate(source_docs)
+            ])
+            
+            # Create prompt
+            prompt = f"""你是一個學術論文助理。請根據以下提供的論文內容回答問題。
+
+相關論文內容：
+{context}
+
+問題：{user_input}
+
+請提供詳細且準確的回答，並在適當時引用來源論文。如果資料中沒有相關資訊，請誠實告知。
+
+回答："""
+            
+            # Stream response from LLM
+            try:
+                for chunk in self.llm.stream(prompt):
+                    yield chunk
+            except GeneratorExit:
+                # Generator was closed externally (e.g., user clicked stop)
+                logger.info("RAG streaming interrupted by external close")
+                raise
+            
+            # Add source information at the end
+            yield "\n\n📚 來源論文：\n"
+            sources = set()
+            for doc in source_docs:
+                source_file = doc.metadata.get('source_file', 'Unknown')
+                sources.add(source_file)
+            
+            for source in sorted(sources):
+                yield f"  • {source}\n"
+            
+            logger.info(f"RAG query streaming completed, used {len(source_docs)} source chunks")
+            
+        except Exception as e:
+            logger.error(f"Error in RAG query streaming: {e}", exc_info=True)
+            yield f"\n\nError processing query: {str(e)}"
+    
     def search_documents(self, query: str, k: int = None) -> List[Dict[str, Any]]:
         """
         Search for relevant documents

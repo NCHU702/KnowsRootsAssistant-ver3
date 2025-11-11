@@ -474,6 +474,39 @@
             to { transform: rotate(360deg); }
         }
 
+        .typing-indicator {
+            display: inline-block;
+            font-size: 24px;
+            color: #667eea;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 0.3; }
+            50% { opacity: 1; }
+        }
+
+        /* Simple agent status display */
+        .agent-status {
+            color: #6b7280;
+            font-size: 14px;
+            font-style: italic;
+            padding: 8px 0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .agent-status::before {
+            content: '';
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background: #f59e0b;
+            border-radius: 50%;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+
         .empty-state {
             display: flex;
             flex-direction: column;
@@ -561,6 +594,28 @@
         #generalSubmitBtn:disabled, #inheritanceSubmitBtn:disabled {
             opacity: 0.6;
             cursor: not-allowed;
+        }
+
+        .stop-btn {
+            padding: 12px 24px;
+            background: #ef4444;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.2s;
+            white-space: nowrap;
+            display: none;
+        }
+
+        .stop-btn:hover {
+            background: #dc2626;
+        }
+
+        .stop-btn.active {
+            display: block;
         }
 
         .error-box {
@@ -960,6 +1015,7 @@
                 <div class="input-wrapper">
                     <textarea id="generalInput" placeholder="Ask me anything... (e.g., 'Search for remote sensing papers 2024')" rows="1"></textarea>
                     <button id="generalSubmitBtn" onclick="submitGeneralQuery()">Send</button>
+                    <button id="stopBtn" class="stop-btn" onclick="stopGeneration()">⏹ Stop</button>
                 </div>
             </div>
 
@@ -986,10 +1042,19 @@
         const inheritanceInput = document.getElementById('inheritanceInput');
         const generalSubmitBtn = document.getElementById('generalSubmitBtn');
         const inheritanceSubmitBtn = document.getElementById('inheritanceSubmitBtn');
+        const stopBtn = document.getElementById('stopBtn');
         const chatTitle = document.getElementById('chatTitle');
         const statusIndicator = document.getElementById('statusIndicator');
         const errorBox = document.getElementById('errorBox');
         const errorMessage = document.getElementById('errorMessage');
+        
+        // Global variable to track current stream reader
+        let currentStreamReader = null;
+        let isStreaming = false;
+        let currentMessageDiv = null;
+        let currentContentDiv = null;
+        let currentStatusDiv = null;
+        let currentFullResponse = '';
         const yearsList = document.getElementById('yearsList');
         const authorsList = document.getElementById('authorsList');
         const researcherSelect = document.getElementById('researcherSelect');
@@ -1006,16 +1071,29 @@
             });
         });
 
+        // Track IME composition state (for Chinese, Japanese input)
+        let isComposing = false;
+        
+        [generalInput, inheritanceInput].forEach(input => {
+            input.addEventListener('compositionstart', () => {
+                isComposing = true;
+            });
+            
+            input.addEventListener('compositionend', () => {
+                isComposing = false;
+            });
+        });
+        
         // Enable Enter key submission
         generalInput.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter' && !e.shiftKey) {
+            if (e.key === 'Enter' && !e.shiftKey && !isComposing) {
                 e.preventDefault();
                 submitGeneralQuery();
             }
         });
 
         inheritanceInput.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter' && !e.shiftKey) {
+            if (e.key === 'Enter' && !e.shiftKey && !isComposing) {
                 e.preventDefault();
                 submitInheritanceQuery();
             }
@@ -1231,42 +1309,274 @@
             setTimeout(() => errorBox.style.display = 'none', 5000);
         }
 
+        function stopGeneration() {
+            if (currentStreamReader) {
+                try {
+                    // Cancel the stream
+                    currentStreamReader.cancel();
+                    currentStreamReader = null;
+                    isStreaming = false;
+                    
+                    // Update UI immediately
+                    // Remove status animation
+                    if (currentStatusDiv) {
+                        currentStatusDiv.remove();
+                        currentStatusDiv = null;
+                    }
+                    
+                    // Show stopped message based on content
+                    if (currentContentDiv) {
+                        if (!currentFullResponse || currentFullResponse.trim() === '') {
+                            // No content yet - show stopped message
+                            currentContentDiv.innerHTML = '<p style="color: #9ca3af; font-style: italic; font-size: 14px;">⏹ Generation stopped</p>';
+                        } else {
+                            // Has content - keep it and mark as stopped
+                            currentContentDiv.innerHTML = markdownToHtml(currentFullResponse + '\n\n*[Stopped by user]*');
+                        }
+                    }
+                    
+                    // Hide stop button, enable submit button
+                    stopBtn.classList.remove('active');
+                    generalSubmitBtn.disabled = false;
+                    
+                    console.log('Stream cancelled by user');
+                } catch (e) {
+                    console.error('Error cancelling stream:', e);
+                }
+            }
+        }
+
         async function submitGeneralQuery() {
             const query = generalInput.value.trim();
             if (!query) return;
+            
+            // Prevent multiple simultaneous requests
+            if (isStreaming) {
+                console.warn('Already streaming, ignoring request');
+                return;
+            }
 
             addMessageToUI(generalContent, 'user', query, null, true, generalHistory);
             generalInput.value = '';
             generalInput.style.height = 'auto';
             generalSubmitBtn.disabled = true;
+            
+            // Show stop button
+            stopBtn.classList.add('active');
+            isStreaming = true;
 
-            addProcessingMessage(generalContent, 'Analyzing query...');
+            // Create a placeholder message for streaming
+            const emptyState = generalContent.querySelector('.empty-state');
+            if (emptyState) emptyState.remove();
+
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message message-assistant';
+            
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'message-content';
+            contentDiv.innerHTML = '<span class="typing-indicator">●</span>';
+            
+            messageDiv.appendChild(contentDiv);
+            generalContent.appendChild(messageDiv);
+            generalContent.scrollTop = generalContent.scrollHeight;
+
+            let fullResponse = '';
+            let actionTaken = null;
+            let statusDiv = null;  // 狀態顯示區
+            
+            // Update global variables for stopGeneration()
+            currentMessageDiv = messageDiv;
+            currentContentDiv = contentDiv;
+            currentStatusDiv = null;
+            currentFullResponse = '';
 
             try {
-                const response = await fetch('/query', {
+                const response = await fetch('/query_stream', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ input: query })
                 });
 
-                const data = await response.json();
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.error || 'Request failed');
+                }
 
-                if (response.ok) {
-                    if (data.action) {
-                        updateProcessingMessage(generalContent, `Executing: ${data.action}`);
-                        await new Promise(resolve => setTimeout(resolve, 800));
-                    }
+                const reader = response.body.getReader();
+                currentStreamReader = reader;  // Save reference for stopping
+                const decoder = new TextDecoder();
+
+                while (true) {
+                    const { done, value } = await reader.read();
                     
-                    removeProcessingMessage(generalContent);
-                    addMessageToUI(generalContent, 'assistant', data.output, data.action, true, generalHistory);
-                } else {
-                    removeProcessingMessage(generalContent);
-                    showError(data.error || 'An error occurred');
+                    if (done) break;
+                    
+                    const chunk = decoder.decode(value);
+                    const lines = chunk.split('\n');
+                    
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            try {
+                                const data = JSON.parse(line.slice(6));
+                                
+                                if (data.type === 'start') {
+                                    actionTaken = data.action || data.mode;
+                                    // 清除載入動畫，顯示狀態
+                                    contentDiv.innerHTML = '';
+                                    statusDiv = document.createElement('div');
+                                    statusDiv.className = 'agent-status';
+                                    statusDiv.textContent = 'Thinking...';
+                                    contentDiv.appendChild(statusDiv);
+                                    currentStatusDiv = statusDiv;  // Update global
+                                    
+                                } else if (data.type === 'thought') {
+                                    // 更新狀態：思考中
+                                    if (statusDiv) {
+                                        statusDiv.textContent = 'Analyzing...';
+                                    }
+                                    
+                                } else if (data.type === 'action') {
+                                    // 更新狀態：執行工具
+                                    if (statusDiv) {
+                                        statusDiv.textContent = `Using ${data.tool}...`;
+                                    }
+                                    
+                                } else if (data.type === 'tool_start') {
+                                    // 更新狀態：工具執行中
+                                    if (statusDiv) {
+                                        statusDiv.textContent = `Executing ${data.tool}...`;
+                                    }
+                                    
+                                } else if (data.type === 'tool_token') {
+                                    // 移除狀態，開始顯示內容
+                                    if (statusDiv) {
+                                        statusDiv.remove();
+                                        statusDiv = null;
+                                        currentStatusDiv = null;  // Update global
+                                    }
+                                    fullResponse += data.content;
+                                    currentFullResponse = fullResponse;  // Update global
+                                    contentDiv.innerHTML = markdownToHtml(fullResponse);
+                                    generalContent.scrollTop = generalContent.scrollHeight;
+                                    
+                                } else if (data.type === 'chunk') {
+                                    // 移除狀態，開始顯示內容
+                                    if (statusDiv) {
+                                        statusDiv.remove();
+                                        statusDiv = null;
+                                        currentStatusDiv = null;  // Update global
+                                    }
+                                    fullResponse += data.content;
+                                    currentFullResponse = fullResponse;  // Update global
+                                    contentDiv.innerHTML = markdownToHtml(fullResponse);
+                                    generalContent.scrollTop = generalContent.scrollHeight;
+                                    
+                                } else if (data.type === 'observation') {
+                                    // 更新狀態：處理結果
+                                    if (statusDiv) {
+                                        statusDiv.textContent = '🔄 Processing results...';
+                                    }
+                                    
+                                } else if (data.type === 'final_answer') {
+                                    // 移除狀態，顯示最終答案
+                                    if (statusDiv) {
+                                        statusDiv.remove();
+                                        statusDiv = null;
+                                    }
+                                    if (!fullResponse) {
+                                        fullResponse = data.content;
+                                        contentDiv.innerHTML = markdownToHtml(fullResponse);
+                                    }
+                                    generalContent.scrollTop = generalContent.scrollHeight;
+                                    
+                                } else if (data.type === 'stopped') {
+                                    // Agent execution was stopped by user
+                                    console.log('Agent execution stopped by user');
+                                    
+                                    // 移除狀態顯示
+                                    if (statusDiv) {
+                                        statusDiv.remove();
+                                        statusDiv = null;
+                                    }
+                                    
+                                    if (!fullResponse || fullResponse.trim() === '') {
+                                        // 還在思考階段（沒有內容）-> 顯示停止訊息
+                                        contentDiv.innerHTML = '<p style="color: #6b7280; font-style: italic;">⏹ Generation stopped</p>';
+                                    } else {
+                                        // 已經開始生成內容 -> 保留內容並標記
+                                        contentDiv.innerHTML = markdownToHtml(fullResponse + '\n\n*[Stopped by user]*');
+                                        generalHistory.push({ 
+                                            role: 'assistant', 
+                                            content: fullResponse + '\n\n[Stopped by user]', 
+                                            action: actionTaken 
+                                        });
+                                    }
+                                    break;
+                                    
+                                } else if (data.type === 'error') {
+                                    showError(data.message || data.content);
+                                    if (!fullResponse) {
+                                        messageDiv.remove();
+                                    }
+                                    break;
+                                    
+                                } else if (data.type === 'done') {
+                                    // 確保狀態已移除
+                                    if (statusDiv) {
+                                        statusDiv.remove();
+                                        statusDiv = null;
+                                    }
+                                    
+                                    // 如果沒有內容，顯示最終輸出
+                                    if (!contentDiv.innerHTML || contentDiv.innerHTML === '') {
+                                        contentDiv.innerHTML = markdownToHtml(fullResponse);
+                                    }
+                                    
+                                    // Save to history
+                                    generalHistory.push({ 
+                                        role: 'assistant', 
+                                        content: fullResponse, 
+                                        action: actionTaken 
+                                    });
+                                }
+                            } catch (e) {
+                                console.error('Error parsing SSE data:', e, line);
+                            }
+                        }
+                    }
                 }
             } catch (error) {
-                removeProcessingMessage(generalContent);
-                showError('Failed to connect: ' + error.message);
+                // Check if error is due to user cancellation
+                if (error.name === 'AbortError' || error.message.includes('cancel')) {
+                    console.log('Stream cancelled by user');
+                    
+                    // 移除狀態顯示（包括動畫）
+                    if (statusDiv) {
+                        statusDiv.remove();
+                        statusDiv = null;
+                    }
+                    
+                    if (!fullResponse || fullResponse.trim() === '') {
+                        // 還在思考階段（沒有內容）-> 顯示停止訊息，停止動畫
+                        contentDiv.innerHTML = '<p style="color: #9ca3af; font-style: italic; font-size: 14px;">⏹ Generation stopped</p>';
+                    } else {
+                        // 已經開始生成內容 -> 保留內容並標記
+                        contentDiv.innerHTML = markdownToHtml(fullResponse + '\n\n*[Stopped by user]*');
+                        generalHistory.push({ 
+                            role: 'assistant', 
+                            content: fullResponse + '\n\n[Stopped by user]', 
+                            action: actionTaken 
+                        });
+                    }
+                } else {
+                    messageDiv.remove();
+                    showError('Failed to connect: ' + error.message);
+                }
             } finally {
+                // Clean up
+                currentStreamReader = null;
+                isStreaming = false;
+                stopBtn.classList.remove('active');
                 generalSubmitBtn.disabled = false;
                 generalInput.focus();
             }
