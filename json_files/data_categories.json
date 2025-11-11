@@ -1028,5 +1028,37 @@
     "其他": [
       "指導教授：陳奕中"
     ]
+  },
+  {
+    "論文標題": "Human Mobility Prediction Challenge: Next Location Prediction using Spatiotemporal BERT",
+    "研究目的": [
+      "预测用户未来位置",
+      "减少训练和预测时间",
+      "捕捉长期移动趋势"
+    ],
+    "年份": [
+      "2023"
+    ],
+    "資料集": [
+      "Human Mobility Prediction Challenge dataset"
+    ],
+    "資料前處理": [
+      "Masking Location IDs",
+      "Date and Time Embedding",
+      "Time Difference Embedding"
+    ],
+    "建模": [
+      "LP-BERT",
+      "Transformer encoder"
+    ],
+    "評估指標": [
+      "Accuracy",
+      "Probability reduction for consecutive stays"
+    ],
+    "其他": [
+      "Parameter settings: embedsize=128, epochs=200, batch size=16",
+      "Masking duration for days: Ћ=15",
+      "Multiplier for stay probabilities: Ќ=0.9"
+    ]
   }
 ]

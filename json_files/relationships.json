@@ -43,6 +43,12 @@
               "student": "李軍磊",
               "title": "利用基於聯邦學習的條件生成對抗網路實現人群流量預測",
               "children": []
+            },
+            {
+              "year": "2023",
+              "student": "HARU TERASHIMA",
+              "title": "Human Mobility Prediction Challenge: Next Location Prediction using Spatiotemporal BERT",
+              "children": []
             }
           ],
           "papers": []

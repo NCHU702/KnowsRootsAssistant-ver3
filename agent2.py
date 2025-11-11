@@ -619,6 +619,7 @@ def upload_paper():
             paper_title = paper_title[0] if paper_title else 'untitled'
         
         stored_filename = storage.store(temp_file_path, paper_title)
+        stored_pdf_path = os.path.join('./data', stored_filename)
         
         # Clean up temp file
         if temp_file_path and os.path.exists(temp_file_path):
@@ -626,10 +627,25 @@ def upload_paper():
         
         logger.info(f"PDF stored successfully: {stored_filename}")
         
+        # Step 6: Add to RAG system
+        message = 'Paper uploaded and processed successfully'
+        if rag_system and rag_system.vectorstore:
+            logger.info("Adding new PDF to RAG system...")
+            result = rag_system.add_document(stored_pdf_path)
+            
+            if result['status'] == 'success':
+                chunks_added = result['chunks_added']
+                duration = result['duration_seconds']
+                logger.info(f"PDF indexed: {chunks_added} chunks in {duration:.1f}s")
+                message = f'Paper uploaded and indexed successfully ({chunks_added} chunks added in {duration:.1f}s)'
+            else:
+                logger.warning(f"PDF upload succeeded but indexing failed: {result.get('error')}")
+                message = 'Paper uploaded successfully, but indexing failed. Please restart service to update search index.'
+        
         # Return success with extracted metadata and classification
         return jsonify({
             'success': True,
-            'message': 'Paper uploaded and processed successfully',
+            'message': message,
             'paper_data': paper_data,
             'classification': classification,
             'stored_filename': stored_filename

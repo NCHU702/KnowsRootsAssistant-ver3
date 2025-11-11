@@ -17,7 +17,7 @@
 **預計時間**：2-3 小時  
 **目標**：實現基本的保存/載入功能
 
-### Task 1.1: 添加配置和路徑管理
+### Task 1.1: 添加配置和路徑管理 ✅
 **文件**：`system_api/rag_system.py`
 
 ```python
@@ -30,11 +30,11 @@ class AcademicRAGSystem:
         self.metadata_path = os.path.join(self.vectorstore_path, "metadata.pkl")
 ```
 
-- [ ] 添加 `vectorstore_path` 屬性
-- [ ] 添加 `metadata_path` 屬性
-- [ ] 確保路徑在初始化時創建
+- [x] 添加 `vectorstore_path` 屬性
+- [x] 添加 `metadata_path` 屬性
+- [x] 確保路徑在初始化時創建
 
-### Task 1.2: 實現 PDF Hash 計算
+### Task 1.2: 實現 PDF Hash 計算 ✅
 **文件**：`system_api/rag_system.py`
 
 ```python
@@ -61,10 +61,10 @@ def _get_pdf_hash(self) -> str:
     return hashlib.sha256(hash_input.encode()).hexdigest()
 ```
 
-- [ ] 實現 `_get_pdf_hash()` 方法
-- [ ] 包含文件名、mtime、size
-- [ ] 包含 chunk_size、chunk_overlap、embedding_model
-- [ ] 測試 hash 計算正確性
+- [x] 實現 `_get_pdf_hash()` 方法
+- [x] 包含文件名、mtime、size
+- [x] 包含 chunk_size、chunk_overlap、embedding_model
+- [x] 測試 hash 計算正確性
 
 ### Task 1.3: 實現保存功能
 **文件**：`system_api/rag_system.py`
@@ -111,13 +111,13 @@ def _save_vectorstore(self) -> bool:
         return False
 ```
 
-- [ ] 實現 `_save_vectorstore()` 方法
-- [ ] 調用 `vectorstore.save_local()`
-- [ ] 創建並保存 metadata（包含 hash、配置、統計）
-- [ ] 添加錯誤處理
-- [ ] 記錄保存時間
+- [x] 實現 `_save_vectorstore()` 方法
+- [x] 調用 `vectorstore.save_local()`
+- [x] 創建並保存 metadata（包含 hash、配置、統計）
+- [x] 添加錯誤處理
+- [x] 記錄保存時間
 
-### Task 1.4: 實現載入功能
+### Task 1.4: 實現載入功能 ✅
 **文件**：`system_api/rag_system.py`
 
 ```python
@@ -171,15 +171,15 @@ def _load_vectorstore(self) -> bool:
         return False
 ```
 
-- [ ] 實現 `_load_vectorstore()` 方法
-- [ ] 檢查 metadata 文件存在
-- [ ] 載入並驗證 hash
-- [ ] 調用 `FAISS.load_local()`
-- [ ] 重建 retriever
-- [ ] 添加詳細日誌
-- [ ] 錯誤處理
+- [x] 實現 `_load_vectorstore()` 方法
+- [x] 檢查 metadata 文件存在
+- [x] 載入並驗證 hash
+- [x] 調用 `FAISS.load_local()`
+- [x] 重建 retriever
+- [x] 添加詳細日誌
+- [x] 錯誤處理
 
-### Task 1.5: 追蹤成功/失敗計數
+### Task 1.5: 追蹤成功/失敗計數 ✅
 **文件**：`system_api/rag_system.py`
 
 在 `_load_documents()` 方法中：
@@ -201,11 +201,11 @@ def _load_documents(self) -> List[Document]:
             # ... 錯誤處理
 ```
 
-- [ ] 添加 `_successful_count` 和 `_failed_count` 屬性
-- [ ] 在文檔處理循環中更新計數
-- [ ] 確保統計準確
+- [x] 添加 `_successful_count` 和 `_failed_count` 屬性
+- [x] 在文檔處理循環中更新計數
+- [x] 確保統計準確
 
-### Task 1.6: 整合到 `_initialize()`
+### Task 1.6: 整合到 `_initialize()` ✅
 **文件**：`system_api/rag_system.py`
 
 ```python
@@ -241,14 +241,14 @@ def _initialize(self):
         raise
 ```
 
-- [ ] 修改 `_initialize()` 方法
-- [ ] 先嘗試 `_load_vectorstore()`
-- [ ] 載入成功則直接返回
-- [ ] 載入失敗則從頭構建
-- [ ] 構建完成後調用 `_save_vectorstore()`
-- [ ] 測試兩種路徑都正常工作
+- [x] 修改 `_initialize()` 方法
+- [x] 先嘗試 `_load_vectorstore()`
+- [x] 載入成功則直接返回
+- [x] 載入失敗則從頭構建
+- [x] 構建完成後調用 `_save_vectorstore()`
+- [x] 測試兩種路徑都正常工作
 
-### Task 1.7: 添加到 `.gitignore`
+### Task 1.7: 添加到 `.gitignore` ✅
 **文件**：`.gitignore`（專案根目錄）
 
 ```gitignore
@@ -256,13 +256,13 @@ def _initialize(self):
 vectorstore/
 ```
 
-- [ ] 確認 `.gitignore` 存在
-- [ ] 添加 `vectorstore/` 條目
-- [ ] 測試 git 不會追蹤向量存儲
+- [x] 確認 `.gitignore` 存在
+- [x] 添加 `vectorstore/` 條目
+- [x] 測試 git 不會追蹤向量存儲
 
 ---
 
-## Phase 2: 增量更新功能（核心）
+## Phase 2: 增量更新功能（核心） ✅
 
 **預計時間**：3-4 小時  
 **目標**：實現新 PDF 快速添加功能
@@ -359,17 +359,17 @@ def add_document(self, pdf_path: str) -> Dict[str, Any]:
         }
 ```
 
-- [ ] 實現 `add_document()` 方法
-- [ ] 載入並分割新 PDF
-- [ ] 應用相同的清理邏輯
-- [ ] Embed 新文檔
-- [ ] 使用 `vectorstore.add_texts()` 合併
-- [ ] 更新統計
-- [ ] 保存向量存儲
-- [ ] 返回詳細結果
-- [ ] 添加錯誤處理
+- [x] 實現 `add_document()` 方法
+- [x] 載入並分割新 PDF
+- [x] 應用相同的清理邏輯
+- [x] Embed 新文檔
+- [x] 使用 `vectorstore.add_texts()` 合併
+- [x] 更新統計
+- [x] 保存向量存儲
+- [x] 返回詳細結果
+- [x] 添加錯誤處理
 
-### Task 2.2: 整合到 Upload Endpoint
+### Task 2.2: 整合到 Upload Endpoint ✅
 **文件**：`agent2.py`
 
 找到 `/upload_paper` endpoint：
@@ -410,13 +410,13 @@ def upload_paper():
         return jsonify({'success': False, 'error': str(e)}), 500
 ```
 
-- [ ] 找到 `upload_paper()` 函數
-- [ ] 在 PDF 保存後調用 `rag_system.add_document()`
-- [ ] 處理返回結果
-- [ ] 更新返回消息
-- [ ] 測試上傳流程
+- [x] 找到 `upload_paper()` 函數
+- [x] 在 PDF 保存後調用 `rag_system.add_document()`
+- [x] 處理返回結果
+- [x] 更新返回消息
+- [x] 測試上傳流程
 
-### Task 2.3: 測試增量更新
+### Task 2.3: 測試增量更新 ✅
 **測試步驟**：
 
 1. **首次啟動測試**
