@@ -1,0 +1,29 @@
+# Core ML / NLP
+sentence-transformers
+torch
+
+# Vector search
+faiss-cpu
+# If you have a working CUDA toolchain and want GPU FAISS, replace the line above with:
+# faiss-gpu
+
+# Data & parsing
+numpy
+pandas
+pypdf
+PyPDF2
+requests
+
+# LangChain & tools
+langchain
+langchain-community
+langchain-ollama
+langchain-text-splitters
+duckduckgo-search
+
+# Web framework
+Flask
+werkzeug
+
+# Web server
+Flask

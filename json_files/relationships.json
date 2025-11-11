@@ -1,0 +1,304 @@
+{
+  "research_forest": [
+    {
+      "area_name": "交通數據分析",
+      "description": "此研究領域專注於運用數據分析與AI模型解決各類交通問題，包含人流預測、路徑規劃、大眾運輸系統優化等。",
+      "trunks": [
+        {
+          "trunk_name": "人流分析與預測",
+          "lineage": [
+            {
+              "year": "2020",
+              "student": "賴紫平",
+              "title": "使用深度學習模型結合二維高斯函數探討交通站點之用量與成因",
+              "children": [
+                {
+                  "year": "2022",
+                  "student": "鄭佳昇",
+                  "title": "基於3D-RCL與條件式生成對抗網路產生未來時刻人群分布之可能性探討",
+                  "children": []
+                }
+              ]
+            },
+            {
+              "year": "2021",
+              "student": "王詠緹",
+              "title": "基於集成式生成對抗網路進行人流異常預測",
+              "children": []
+            },
+            {
+              "year": "2021",
+              "student": "鄭力誠",
+              "title": "基於R-tree 與SPACE-MDL-LSTM提升大區域人流預測之效率",
+              "children": []
+            },
+            {
+              "year": "2022",
+              "student": "李香蘭",
+              "title": "應用補償式遷移學習模型於區域人流之強健性預測",
+              "children": []
+            },
+            {
+              "year": "2024",
+              "student": "李軍磊",
+              "title": "利用基於聯邦學習的條件生成對抗網路實現人群流量預測",
+              "children": []
+            }
+          ],
+          "papers": []
+        },
+        {
+          "trunk_name": "大眾運輸系統分析",
+          "lineage": [
+            {
+              "year": "2020",
+              "student": "王怡婷",
+              "title": "基於卷積類神經網路之澳門公車軌跡辨識",
+              "children": []
+            },
+            {
+              "year": "2021",
+              "student": "盧政傑",
+              "title": "基於人流資料、土地使用分區圖以及Google趨勢資料進行捷運進出站人數預測-以台北捷運為例",
+              "children": []
+            }
+          ],
+          "papers": []
+        },
+        {
+          "trunk_name": "路網與路徑分析",
+          "lineage": [
+            {
+              "year": "2017",
+              "student": "歐晉佑",
+              "title": "基於模糊類神經網路的路網旅行時間預測方法",
+              "children": []
+            },
+            {
+              "year": "2017",
+              "student": "邱聖崴",
+              "title": "近似巡訪天際線路徑查詢",
+              "children": []
+            }
+          ],
+          "papers": []
+        },
+        {
+          "trunk_name": "公共自行車 (YouBike) 分析",
+          "lineage": [
+            {
+              "year": "2022",
+              "student": "陳詳元",
+              "title": "以純Youbike資料識別Covid-19對臺北市區活動的影響",
+              "children": []
+            }
+          ],
+          "papers": []
+        },
+        {
+          "trunk_name": "智慧交通與生成式AI",
+          "lineage": [
+            {
+              "year": "2025",
+              "student": "洪意雯",
+              "title": "融合Yolov11與RAG之道路安全路徑推薦系統",
+              "children": []
+            },
+            {
+              "year": "2025",
+              "student": "楊竣傑",
+              "title": "結合CGAN與LLM的道路標線生成與語意解析系統",
+              "children": []
+            },
+            {
+              "year": "2025",
+              "student": "林子雁",
+              "title": "基於條件式GAN、GPT和RAG之中山高速公路客製化行車建議推薦系統",
+              "children": []
+            }
+          ],
+          "papers": []
+        }
+      ]
+    },
+    {
+      "area_name": "醫療健康領域",
+      "description": "此方向專注於將深度學習技術應用於解決實際的醫療問題，尤其在癌症影像辨識與醫院管理上展現了傳承。",
+      "trunks": [
+        {
+          "trunk_name": "醫院管理與流行病學",
+          "lineage": [
+            {
+              "year": "2023",
+              "student": "施長宏",
+              "title": "利用RBF-DNN配合醫院病患人流資料探究流行病之院內感染熱區",
+              "children": []
+            }
+          ],
+          "papers": []
+        },
+        {
+          "trunk_name": " cancers image recognition",
+          "lineage": [
+            {
+              "year": "2021",
+              "student": "吳文成",
+              "title": [
+                "基於深度學習之鼻咽癌腫塊辨識",
+                "Recognition of Nasopharyngeal Carcinoma Discrimination from Endoscopic Images Based on Deep Learning Models"
+              ],
+              "children": []
+            }
+          ]
+        },
+        {
+          "trunk_name": "cancers image recognition",
+          "lineage": [
+            {
+              "year": "2024",
+              "student": "cha",
+              "title": "基於深度學習之鼻咽癌腫塊辨識",
+              "children": []
+            },
+            {
+              "year": "2018",
+              "student": "charles",
+              "title": "鼻咽癌腫塊辨識測試123",
+              "children": []
+            },
+            {
+              "year": "2026",
+              "student": "abcde",
+              "title": "鼻癌腫塊辨識",
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "area_name": "商業與工業應用",
+      "description": "此方向涵蓋了金融科技、智慧製造與資源優化等多個面向，旨在解決產業界的實際痛點。",
+      "trunks": [
+        {
+          "trunk_name": "金融與價格預測",
+          "lineage": [
+            {
+              "year": "2020",
+              "student": "鍾久祿",
+              "title": "使用STL分解法和類神經網絡進行長期股價預測",
+              "children": []
+            },
+            {
+              "year": "2025",
+              "student": "吳昺儒",
+              "title": "利用Llama3解譯股票預測模型之運行參數以實現股票投資問答系統",
+              "children": []
+            }
+          ],
+          "papers": []
+        },
+        {
+          "trunk_name": "智慧製造與生產力優化",
+          "lineage": [
+            {
+              "year": "2021",
+              "student": "陳柏翔",
+              "title": "利用生成對抗網路產生模擬資料以提昇刀具磨耗預測之準確率",
+              "note": "開創性研究",
+              "children": [
+                {
+                  "year": "2023",
+                  "student": "楊添翼",
+                  "title": "利用 RBF-UNet 以提昇刀具磨耗預測之準確率",
+                  "children": []
+                }
+              ]
+            }
+          ],
+          "papers": []
+        }
+      ]
+    },
+    {
+      "area_name": "環境監測與資源管理",
+      "description": "此方向聚焦於環境相關的預測性問題，如空氣品質預測與水資源分配，展現了持續性的研究投入。",
+      "trunks": [
+        {
+          "trunk_name": "空氣品質預測",
+          "lineage": [
+            {
+              "year": "2019",
+              "student": "李東錡",
+              "title": "基於類神經網路之區域PM2.5預測",
+              "note": "開創性研究",
+              "children": [
+                {
+                  "year": "2021",
+                  "student": "江吉晟",
+                  "title": "應用三維高斯函數結合深度學習之區域 PM2.5 預測",
+                  "children": []
+                }
+              ]
+            }
+          ],
+          "papers": []
+        },
+        {
+          "trunk_name": "農業與水資源",
+          "lineage": [
+            {
+              "year": "2019",
+              "student": "林聖晧",
+              "title": "使用模糊類神經網路預測灌溉用水分配-以濁幹線系統為例",
+              "children": []
+            },
+            {
+              "year": "2021",
+              "student": "許畯棠",
+              "title": "應用集成式深度學習模型進行芒果分類辨識",
+              "children": []
+            }
+          ],
+          "papers": []
+        }
+      ]
+    },
+    {
+      "area_name": "其他研究方向",
+      "description": "這些研究如同森林中獨特的樹種，雖然未形成明顯的傳承鏈，但同樣展現了研究室探索新領域的活力。",
+      "trunks": [
+        {
+          "trunk_name": "獨立研究",
+          "lineage": [
+            {
+              "year": "2019",
+              "student": "周映均",
+              "title": "基於社群網路資料之旅遊區辨識",
+              "children": []
+            },
+            {
+              "year": "2021",
+              "student": "陳姿靜",
+              "title": "應用生成對抗網路於復康巴士之資源分配最佳化—以雲林縣為例",
+              "children": []
+            },
+            {
+              "year": "2021",
+              "student": "李靜瑜",
+              "title": "基於生成對抗網路設計循環風扇控制系統以進行冷氣房之微空間溫度調整",
+              "children": []
+            },
+            {
+              "year": "2023",
+              "student": "馬承安",
+              "title": "應用自動編碼器架構於影片生成文字敘述 - 以美國職業籃球聯賽比賽為例",
+              "children": []
+            }
+          ],
+          "papers": []
+        }
+      ]
+    }
+  ]
+}
