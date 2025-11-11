@@ -161,7 +161,7 @@ def retry_failed_documents(self):
 - B) 實現增量更新功能（快但複雜）
 - C) 標記為 dirty，下次重啟重建（簡單但延遲）
 
-**建議**：短期用 C，長期實現 B
+**✅ 決策**：**選項 C - 增量更新**（實施增量文檔添加功能）
 
 #### Q2: 是否需要 API endpoint 手動觸發重建？
 ```python
@@ -178,7 +178,7 @@ def rebuild_rag():
 - 懷疑向量存儲損壞
 - 想強制重建而不重啟服務
 
-**建議**：**需要**，對生產環境很有用
+**✅ 決策**：**不需要**（保持系統簡單，通過重啟服務即可重建）
 
 #### Q3: 16% 失敗率是否可接受？
 **現況**：
@@ -194,7 +194,7 @@ def rebuild_rag():
 - B) 實現失敗重試機制
 - C) 改進內容清理邏輯減少失敗率
 
-**建議**：A + 記錄詳細失敗信息，未來可手動重試
+**✅ 決策**：**選項 A - 接受現狀**（保存 84% 成功文檔，記錄失敗統計）
 
 ### 🟡 中優先級
 
@@ -279,24 +279,25 @@ def _save_vectorstore(self):
 
 When a new PDF is uploaded via `/upload_paper`:
 
-**Option 1: Immediate Rebuild (Current Proposal)**
-- Store PDF to ./data
-- Call `rag_system.reload(force_rebuild=True)`
-- ❌ Blocks upload for 6-10 minutes
-
-**Option 2: Lazy Rebuild (Recommended)**
-- Store PDF to ./data
-- Mark vectorstore as dirty: delete metadata.pkl
-- Next startup automatically rebuilds
-- ✅ Upload completes immediately
-- ⚠️ New PDF not searchable until restart
-
-**Option 3: Incremental Update (Future Enhancement)**
+**✅ Chosen: Option 3 - Incremental Update**
 - Store PDF to ./data
 - Call `rag_system.add_document(pdf_path)`
 - Embed only new PDF (~10-30s)
 - Merge into existing vectorstore
-- ✅ Best UX, requires additional implementation
+- ✅ Best UX
+- ✅ Upload completes in 10-30 seconds
+- ✅ New PDF immediately searchable
+
+Implementation details:
+```python
+def add_document(self, pdf_path: str) -> Dict:
+    """Add a single PDF to existing vectorstore"""
+    # 1. Load and process new PDF
+    # 2. Embed new documents
+    # 3. Merge into existing FAISS index
+    # 4. Update and save metadata
+    return {'status': 'success', 'chunks_added': count}
+```
 ```
 
 #### 2. 失敗處理策略
@@ -400,7 +401,7 @@ Use cases:
 
 ## 實施階段修正
 
-### Phase 1: 核心持久化（MVP）
+### Phase 1: 核心持久化（基礎）
 **時間**：2-3 小時
 
 ✅ 包含：
@@ -410,27 +411,28 @@ Use cases:
 - 基本錯誤處理
 - 記錄統計信息（成功/失敗計數）
 
-❌ 不包含：
-- Upload 後處理
-- 手動重建 API
-- 增量更新
-
-### Phase 2: Upload 整合
-**時間**：1 小時
-
-✅ 包含：
-- Upload 後標記 dirty
-- 手動重建 API endpoint
-- 用戶提示（需要重啟）
-
-### Phase 3: 增強功能（可選）
+### Phase 2: 增量更新功能（核心）
 **時間**：3-4 小時
 
 ✅ 包含：
-- 增量文檔添加
-- 失敗文檔重試
-- 原子性保存
-- 更詳細的統計
+- 實現 `add_document()` 方法
+- FAISS 索引合併邏輯
+- Upload endpoint 整合
+- 更新 metadata 追蹤
+- 測試新 PDF 上傳流程
+
+❌ 不包含：
+- 手動重建 API（已決定不需要）
+- 失敗文檔重試（接受現狀）
+
+### Phase 3: 優化與穩定性（可選）
+**時間**：2-3 小時
+
+✅ 包含：
+- 原子性保存（防止損壞）
+- 更詳細的統計和日誌
+- 磁盤空間檢查
+- 性能優化
 
 ## 總結
 
@@ -439,13 +441,16 @@ Use cases:
 - 與現有架構兼容良好
 - 性能提升顯著（50-100x）
 
-### ⚠️ 需要明確處理
-1. **Upload 後同步問題** → 建議：短期標記 dirty，長期增量更新
-2. **16% 失敗率影響** → 建議：記錄失敗，提供重試，改進清理
-3. **手動控制需求** → 建議：加入重建 API endpoint
+### ✅ 已確認決策
+1. **Upload 後同步問題** → **增量更新**（10-30秒內可查詢新 PDF）
+2. **16% 失敗率影響** → **接受現狀**（記錄統計，不實施重試）
+3. **手動控制需求** → **不需要**（通過重啟服務重建）
+4. **存放位置** → **./vectorstore/**（專案根目錄）
 
-### 📋 建議下一步
-1. 確認 Upload 處理策略（選項 A/B/C）
-2. 決定是否需要手動重建 API
-3. 確定失敗文檔的處理方式
-4. 開始 Phase 1 實施（核心 MVP）
+### 📋 實施計劃
+1. ✅ Phase 1: 核心持久化（基礎保存/載入）
+2. ✅ Phase 2: 增量更新功能（Upload 整合）
+3. ⭐ Phase 3: 優化與穩定性（可選）
+
+**預計總時間**：5-7 小時
+**核心目標**：Upload 後 10-30 秒即可查詢新 PDF
