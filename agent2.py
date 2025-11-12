@@ -20,7 +20,6 @@ from system_api.database_updater import DatabaseUpdater
 from system_api.pdf_storage import PDFStorage
 from system_api.rag_system import AcademicRAGSystem
 from collections import Counter
-# 
 model_name = "jcai/llama-3-taiwan-8b-instruct:q4_k_m"
 
 # Set up logging for debugging
