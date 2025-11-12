@@ -35,7 +35,7 @@ try:
     rag_system = AcademicRAGSystem(
         pdf_directory="./data",
         model_name=model_name,
-        embedding_model="nomic-embed-text",  # or another embedding model
+        embedding_model="embeddinggemma:latest",  # or another embedding model
         chunk_size=800,  # 減小以避免 Ollama embedding 限制
         chunk_overlap=100,  # 減少重疊
         k_documents=4
