@@ -18,9 +18,9 @@ from system_api.pdf_validator import PDFValidator
 from system_api.paper_extractor import PaperExtractor
 from system_api.database_updater import DatabaseUpdater
 from system_api.pdf_storage import PDFStorage
-from system_api.rag_system import AcademicRAGSystem
+from system_api.hierarchical_rag_system import HierarchicalRAGSystem
 from collections import Counter
-model_name = "jcai/llama-3-taiwan-8b-instruct:q4_k_m"
+model_name = "gemma3:12b"
 
 # Set up logging for debugging
 logging.basicConfig(level=logging.INFO)
@@ -28,21 +28,37 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Initialize Rag system
-logger.info("Initializing RAG System...")
+# ============================================================================
+# Hierarchical RAG System Configuration
+# ============================================================================
+logger.info("Initializing Hierarchical RAG System...")
 rag_system = None
+
 try:
-    rag_system = AcademicRAGSystem(
+    rag_system = HierarchicalRAGSystem(
         pdf_directory="./data",
         model_name=model_name,
-        embedding_model="embeddinggemma:latest",  # or another embedding model
-        chunk_size=800,  # 減小以避免 Ollama embedding 限制
-        chunk_overlap=100,  # 減少重疊
-        k_documents=4
+        embedding_model="embeddinggemma:latest",
+        vectorstore_path="./vectorstore",
+        chunk_size=800,
+        chunk_overlap=100,
+        config={
+            'thresholds': {
+                'layer1': float(os.getenv('LAYER1_THRESHOLD', '0.7')),
+                'layer2': float(os.getenv('LAYER2_THRESHOLD', '0.8'))
+            },
+            'expansion': {
+                'enabled': os.getenv('ENABLE_EXPANSION', 'true').lower() == 'true'
+            },
+            'performance': {
+                'cache_size': int(os.getenv('CACHE_SIZE', '10'))
+            }
+        }
     )
-    logger.info("RAG System initialized successfully")
+    logger.info("✓ Hierarchical RAG System initialized successfully")
+        
 except Exception as e:
-    logger.error(f"Failed to initialize RAG System: {e}")
+    logger.error(f"Failed to initialize Hierarchical RAG System: {e}", exc_info=True)
     rag_system = None
 # Add this after initializing other components
 logger.info("Loading data categories...")
@@ -958,18 +974,186 @@ def update_paper():
             'error': f'Update failed: {str(e)}'
         }), 500
 
+# ============================================================================
+# Hierarchical RAG Monitoring Endpoints
+# ============================================================================
+
+@app.route('/rag/stats', methods=['GET'])
+def rag_stats():
+    """
+    獲取 RAG 系統統計資訊
+    
+    Returns:
+        - mode: RAG 模式 (legacy/hierarchical)
+        - system_stats: 系統統計（文檔數、索引狀態等）
+        - query_stats: 查詢統計（僅 hierarchical 模式）
+    """
+    try:
+        if not rag_system:
+            return jsonify({'error': 'RAG system not initialized'}), 503
+        
+        # 基本資訊
+        stats = {
+            'mode': 'hierarchical',
+            'system_ready': rag_system.is_ready() if hasattr(rag_system, 'is_ready') else True
+        }
+        
+        # 獲取系統統計
+        system_stats = rag_system.get_stats()
+        stats['system_stats'] = system_stats
+        
+        # 獲取查詢統計
+        if hasattr(rag_system, 'query_logger'):
+            try:
+                query_stats = rag_system.query_logger.get_statistics()
+                stats['query_stats'] = query_stats
+                
+                # 性能摘要
+                perf_summary = rag_system.query_logger.get_performance_summary()
+                stats['performance_summary'] = perf_summary
+            except Exception as e:
+                logger.warning(f"Failed to get query stats: {e}")
+                stats['query_stats'] = None
+        
+        return jsonify(stats), 200
+        
+    except Exception as e:
+        logger.error(f"Failed to get RAG stats: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/rag/health', methods=['GET'])
+def rag_health():
+    """
+    RAG 系統健康檢查
+    
+    Returns:
+        - status: healthy/degraded/unhealthy
+        - components: 各組件狀態
+        - issues: 問題列表（如有）
+    """
+    try:
+        health = {
+            'status': 'healthy',
+            'components': {},
+            'issues': []
+        }
+        
+        # 檢查 RAG 系統
+        if not rag_system:
+            health['status'] = 'unhealthy'
+            health['issues'].append('RAG system not initialized')
+            health['components']['rag_system'] = 'down'
+        else:
+            health['components']['rag_system'] = 'up'
+            
+            # 檢查是否就緒
+            if hasattr(rag_system, 'is_ready'):
+                is_ready = rag_system.is_ready()
+                if not is_ready:
+                    health['status'] = 'degraded'
+                    health['issues'].append('RAG system not ready (indices not built)')
+                    health['components']['indices'] = 'not_ready'
+                else:
+                    health['components']['indices'] = 'ready'
+        
+        # 檢查階層式索引
+        if rag_system:
+            try:
+                stats = rag_system.get_stats()
+                
+                # 檢查 Layer 1
+                if stats.get('layer1', {}).get('is_initialized'):
+                    health['components']['layer1'] = 'up'
+                else:
+                    health['components']['layer1'] = 'down'
+                    health['status'] = 'degraded'
+                    health['issues'].append('Layer 1 not initialized')
+                
+                # 檢查 Layer 2
+                if stats.get('layer2', {}).get('is_initialized'):
+                    health['components']['layer2'] = 'up'
+                else:
+                    health['components']['layer2'] = 'down'
+                    health['status'] = 'degraded'
+                    health['issues'].append('Layer 2 not initialized')
+                    
+            except Exception as e:
+                health['status'] = 'degraded'
+                health['issues'].append(f'Failed to check components: {str(e)}')
+        
+        return jsonify(health), 200
+        
+    except Exception as e:
+        logger.error(f"Health check failed: {e}", exc_info=True)
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e)
+        }), 500
+
+
+@app.route('/rag/mode', methods=['GET'])
+def rag_mode():
+    """
+    獲取當前 RAG 模式資訊
+    
+    Returns:
+        - mode: 當前模式
+        - features: 支援的功能
+        - config: 配置資訊
+    """
+    try:
+        mode_info = {
+            'mode': 'hierarchical',
+            'type': 'HierarchicalRAGSystem',
+            'features': ['two-layer', 'confidence-evaluation', 'context-expansion'],
+            'config': {
+                'layer1_threshold': float(os.getenv('LAYER1_THRESHOLD', '0.7')),
+                'layer2_threshold': float(os.getenv('LAYER2_THRESHOLD', '0.8')),
+                'expansion_enabled': os.getenv('ENABLE_EXPANSION', 'true').lower() == 'true',
+                'cache_size': int(os.getenv('CACHE_SIZE', '10'))
+            }
+        }
+        
+        return jsonify(mode_info), 200
+        
+    except Exception as e:
+        logger.error(f"Failed to get mode info: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
-    print("\n" + "="*50)
-    print("AI Agent Router Starting...")
-    print("="*50)
-    print("\nSystem Status:")
+    print("\n" + "="*70)
+    print("🚀 AI Agent Router Starting...")
+    print("="*70)
+    print("\n📊 System Status:")
+    print(f"  RAG Mode: HIERARCHICAL (HierarchicalRAGSystem)")
     print(f"  RAG System: {'✓ Ready' if rag_system else '✗ Failed'}")
+    
+    if rag_system:
+        try:
+            stats = rag_system.get_stats()
+            is_ready = rag_system.is_ready()
+            print(f"  System Ready: {'✓ Yes' if is_ready else '⚠ No (indices not built)'}")
+            if is_ready:
+                layer1_stats = stats.get('layer1', {})
+                layer2_stats = stats.get('layer2', {})
+                print(f"  Layer 1: {layer1_stats.get('paper_count', 0)} papers")
+                print(f"  Layer 2: {layer2_stats.get('chunk_count', 0)} chunks")
+        except Exception as e:
+            print(f"  ⚠ Warning: Could not get stats: {e}")
+    
     print(f"  ResearchInheritanceAnalyzer: {'✓ Ready' if inheritance_analyzer else '✗ Failed'}")
     print(f"  Inheritance LLM: {'✓ Ready' if inheritance_llm else '✗ Failed'}")
     print(f"  Agent LLM: {'✓ Ready' if agent_llm else '✗ Failed'}")
     
-    if rag_system:
-        stats = rag_system.get_stats()
-        print(f"  RAG Documents: {stats.get('total_documents', 0)}")
+    print("\n🌐 Monitoring Endpoints:")
+    print("  GET  /rag/stats  - System statistics")
+    print("  GET  /rag/health - Health check")
+    print("  GET  /rag/mode   - Current RAG mode info")
+    
+    print("\n" + "="*70)
+    print("Server running on http://localhost:4000")
+    print("="*70 + "\n")
     
     app.run(debug=False, port=4000)

@@ -1,0 +1,604 @@
+"""
+Hierarchical RAG System - Main Orchestrator
+
+This is the core system that integrates all hierarchical RAG components:
+- Layer 1: Paper-level retrieval (abstracts)
+- Layer 2: Chunk-level retrieval (filtered by Layer 1 results)
+- Confidence Evaluation: Early termination decision
+- Context Expansion: Dynamic context around retrieved chunks
+"""
+
+import os
+import logging
+import time
+from typing import List, Dict, Any, Optional, Tuple, Generator
+from datetime import datetime
+
+from langchain_ollama import OllamaLLM, OllamaEmbeddings
+from langchain_core.documents import Document
+
+from system_api.abstract_extractor import AbstractExtractor
+from system_api.layer1_vectorstore import Layer1VectorStore
+from system_api.layer2_vectorstore import Layer2VectorStore
+from system_api.confidence_evaluator import ConfidenceEvaluator
+from system_api.context_expander import ContextExpander
+
+logger = logging.getLogger(__name__)
+
+
+# Configuration
+HIERARCHICAL_RAG_CONFIG = {
+    'layer1': {
+        'k_documents': 15,  # Number of papers to retrieve
+        'confidence_threshold': 0.7,  # Early termination threshold
+    },
+    'layer2': {
+        'k_documents': 10,  # Number of chunks to retrieve
+        'confidence_threshold': 0.8,  # Early termination threshold
+    },
+    'expansion': {
+        'enabled': True,
+        'ranges': {
+            'high': 1,    # ±1 chunks when confidence ≥ 0.85
+            'medium': 2,  # ±2 chunks when 0.75 ≤ confidence < 0.85
+            'low': 3      # ±3 chunks when confidence < 0.75
+        }
+    },
+    'performance': {
+        'use_cache': True,
+        'cache_size': 10,
+    }
+}
+
+
+class HierarchicalRAGSystem:
+    """
+    Main Hierarchical RAG System
+    
+    Query flow:
+    1. Layer 1: Retrieve relevant papers by searching abstracts
+    2. Evaluate: Check if Layer 1 results are sufficient
+    3. Layer 2: If needed, retrieve specific chunks from selected papers
+    4. Evaluate: Check if Layer 2 results are sufficient
+    5. Expand: Dynamically expand context based on confidence
+    6. Generate: Use LLM to generate final answer
+    """
+    
+    def __init__(
+        self,
+        pdf_directory: str = "./data",
+        model_name: str = "gemma3:12b",
+        embedding_model: str = "embeddinggemma:latest",
+        vectorstore_path: str = "./vectorstore",
+        chunk_size: int = 800,
+        chunk_overlap: int = 100,
+        config: Optional[Dict[str, Any]] = None
+    ):
+        """
+        Initialize Hierarchical RAG System
+        
+        Args:
+            pdf_directory: Directory containing PDF files
+            model_name: LLM model name
+            embedding_model: Embedding model name
+            vectorstore_path: Base path for vector stores
+            chunk_size: Size of text chunks
+            chunk_overlap: Overlap between chunks
+            config: Optional configuration override
+        """
+        self.pdf_directory = pdf_directory
+        self.model_name = model_name
+        self.embedding_model = embedding_model
+        self.vectorstore_path = vectorstore_path
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        
+        # Merge config
+        self.config = HIERARCHICAL_RAG_CONFIG.copy()
+        if config:
+            self.config.update(config)
+        
+        # Initialize components
+        logger.info("Initializing Hierarchical RAG System...")
+        logger.info(f"  Model: {model_name}")
+        logger.info(f"  Embeddings: {embedding_model}")
+        logger.info(f"  PDF Directory: {pdf_directory}")
+        logger.info(f"  Vector Store: {vectorstore_path}")
+        
+        # LLM and Embeddings
+        # Note: OllamaLLM uses temperature parameter during initialization, not per-call
+        self.llm = OllamaLLM(model=model_name)
+        self.embeddings = OllamaEmbeddings(model=embedding_model)
+        
+        # Separate LLM for confidence evaluation (use same model, deterministic mode preferred)
+        # Note: If temperature is not supported, rely on model's default behavior
+        self.evaluation_llm = OllamaLLM(model=model_name)
+        
+        # Core components
+        self.abstract_extractor = AbstractExtractor(self.llm)
+        
+        self.layer1 = Layer1VectorStore(
+            embeddings=self.embeddings,
+            vectorstore_path=os.path.join(vectorstore_path, "layer1")
+        )
+        
+        self.layer2 = Layer2VectorStore(
+            embeddings=self.embeddings,
+            vectorstore_path=os.path.join(vectorstore_path, "layer2"),
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            cache_size=self.config['performance']['cache_size']
+        )
+        
+        self.confidence_evaluator = ConfidenceEvaluator(self.evaluation_llm)
+        self.context_expander = ContextExpander(self.layer2)
+        
+        # Try to load existing indices
+        self._load_indices()
+        
+        logger.info("Hierarchical RAG System initialized successfully")
+    
+    def _load_indices(self):
+        """Load existing vector store indices"""
+        logger.info("Loading existing indices...")
+        
+        layer1_loaded = self.layer1.load()
+        layer2_loaded = self.layer2.load()
+        
+        if layer1_loaded and layer2_loaded:
+            logger.info("✓ Both indices loaded successfully")
+            stats1 = self.layer1.get_stats()
+            stats2 = self.layer2.get_stats()
+            logger.info(f"  Layer 1: {stats1['paper_count']} papers")
+            logger.info(f"  Layer 2: {stats2['chunk_count']} chunks from {stats2['paper_count']} papers")
+        elif layer1_loaded:
+            logger.warning("⚠️  Only Layer 1 loaded, Layer 2 needs building")
+        elif layer2_loaded:
+            logger.warning("⚠️  Only Layer 2 loaded, Layer 1 needs building")
+        else:
+            logger.info("ℹ️  No existing indices found, need to build from scratch")
+    
+    def build_indices(self, pdf_paths: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        Build hierarchical indices from PDF files
+        
+        Args:
+            pdf_paths: Optional list of specific PDF paths. If None, uses all PDFs in pdf_directory
+            
+        Returns:
+            Dictionary with build statistics
+        """
+        start_time = time.time()
+        logger.info("="*80)
+        logger.info("Building Hierarchical Indices")
+        logger.info("="*80)
+        
+        # Get PDF paths
+        if pdf_paths is None:
+            pdf_paths = self._get_all_pdfs()
+        
+        if not pdf_paths:
+            logger.error("No PDF files found")
+            return {'status': 'error', 'message': 'No PDF files found'}
+        
+        logger.info(f"Processing {len(pdf_paths)} PDF files...")
+        
+        # Extract and process documents
+        abstracts = []
+        all_chunks = []
+        
+        from PyPDF2 import PdfReader
+        
+        for i, pdf_path in enumerate(pdf_paths, 1):
+            try:
+                logger.info(f"[{i}/{len(pdf_paths)}] Processing: {os.path.basename(pdf_path)}")
+                
+                # Read PDF
+                reader = PdfReader(pdf_path)
+                pdf_text = ""
+                for page in reader.pages:
+                    pdf_text += page.extract_text() + "\n"
+                
+                # Generate paper_id from filename
+                paper_id = os.path.splitext(os.path.basename(pdf_path))[0]
+                
+                # Extract abstract (for Layer 1)
+                abstract_result = self.abstract_extractor.extract(
+                    pdf_path=pdf_path,
+                    pdf_text=pdf_text,
+                    paper_id=paper_id
+                )
+                
+                if abstract_result:
+                    abstracts.append(abstract_result)
+                    logger.info(f"  ✓ Abstract: {abstract_result['source']} (confidence: {abstract_result['confidence']:.2f})")
+                
+                # Split into chunks (for Layer 2)
+                chunks = self.layer2.text_splitter.create_documents(
+                    texts=[pdf_text],
+                    metadatas=[{
+                        'paper_id': paper_id,
+                        'pdf_path': pdf_path,
+                        'source': 'hierarchical_build'
+                    }]
+                )
+                
+                # Add chunk metadata
+                for idx, chunk in enumerate(chunks):
+                    chunk.metadata['chunk_id'] = f"{paper_id}_chunk_{idx}"
+                    chunk.metadata['chunk_index'] = idx
+                
+                all_chunks.extend(chunks)
+                logger.info(f"  ✓ Chunks: {len(chunks)}")
+                
+            except Exception as e:
+                logger.error(f"  ✗ Failed to process {pdf_path}: {e}")
+                continue
+        
+        # Build Layer 1 index
+        logger.info("\n" + "="*80)
+        logger.info("Building Layer 1 Index (Abstracts)")
+        logger.info("="*80)
+        
+        if abstracts:
+            success = self.layer1.build_index(abstracts)
+            if success:
+                logger.info("✓ Layer 1 index built successfully")
+            else:
+                logger.error("✗ Layer 1 index build failed")
+        else:
+            logger.warning("⚠️  No abstracts extracted, skipping Layer 1")
+        
+        # Build Layer 2 index
+        logger.info("\n" + "="*80)
+        logger.info("Building Layer 2 Index (Chunks)")
+        logger.info("="*80)
+        
+        if all_chunks:
+            success = self.layer2.build_index(all_chunks)
+            if success:
+                logger.info("✓ Layer 2 index built successfully")
+            else:
+                logger.error("✗ Layer 2 index build failed")
+        else:
+            logger.warning("⚠️  No chunks created, skipping Layer 2")
+        
+        # Summary
+        duration = time.time() - start_time
+        stats = self.get_stats()
+        
+        logger.info("\n" + "="*80)
+        logger.info("Build Complete")
+        logger.info("="*80)
+        logger.info(f"Duration: {duration:.1f}s")
+        logger.info(f"Papers: {stats['layer1']['paper_count']}")
+        logger.info(f"Chunks: {stats['layer2']['chunk_count']}")
+        logger.info("="*80)
+        
+        return {
+            'status': 'success',
+            'duration': duration,
+            'papers_processed': len(pdf_paths),
+            'abstracts_extracted': len(abstracts),
+            'chunks_created': len(all_chunks),
+            'stats': stats
+        }
+    
+    def _get_all_pdfs(self) -> List[str]:
+        """Get all PDF files in pdf_directory"""
+        pdf_paths = []
+        
+        if not os.path.exists(self.pdf_directory):
+            logger.warning(f"PDF directory does not exist: {self.pdf_directory}")
+            return pdf_paths
+        
+        for filename in os.listdir(self.pdf_directory):
+            if filename.lower().endswith('.pdf'):
+                pdf_paths.append(os.path.join(self.pdf_directory, filename))
+        
+        return sorted(pdf_paths)
+    
+    def query(self, query: str) -> str:
+        """
+        Query the hierarchical RAG system (blocking version)
+        
+        Args:
+            query: User query string
+            
+        Returns:
+            Generated answer string
+        """
+        result = self._hierarchical_retrieval(query)
+        
+        if result['status'] == 'error':
+            return f"Error: {result['message']}"
+        
+        # Generate answer using LLM
+        return self._generate_answer(query, result)
+    
+    def query_stream(self, query: str) -> Generator[str, None, None]:
+        """
+        Query the hierarchical RAG system (streaming version)
+        
+        Args:
+            query: User query string
+            
+        Yields:
+            Answer chunks as they are generated
+        """
+        # Perform hierarchical retrieval
+        result = self._hierarchical_retrieval(query)
+        
+        if result['status'] == 'error':
+            yield f"Error: {result['message']}"
+            return
+        
+        # Generate answer with streaming
+        yield from self._generate_answer_stream(query, result)
+    
+    def _hierarchical_retrieval(self, query: str) -> Dict[str, Any]:
+        """
+        Core hierarchical retrieval logic
+        
+        Args:
+            query: User query
+            
+        Returns:
+            Dictionary with retrieval results and metadata
+        """
+        start_time = time.time()
+        logger.info(f"Starting hierarchical retrieval for: '{query[:100]}'")
+        
+        result = {
+            'status': 'success',
+            'query': query,
+            'layers_used': [],
+            'timings': {},
+            'evaluations': {}
+        }
+        
+        try:
+            # ============================================================
+            # LAYER 1: Paper-level retrieval
+            # ============================================================
+            logger.info("="*60)
+            logger.info("LAYER 1: Paper-level Retrieval")
+            logger.info("="*60)
+            
+            layer1_start = time.time()
+            
+            if not self.layer1.is_initialized:
+                raise ValueError("Layer 1 index not initialized")
+            
+            k1 = self.config['layer1']['k_documents']
+            layer1_docs = self.layer1.search(query, k=k1)
+            
+            result['timings']['layer1_retrieval'] = time.time() - layer1_start
+            result['layers_used'].append('layer1')
+            
+            logger.info(f"Retrieved {len(layer1_docs)} papers")
+            for i, doc in enumerate(layer1_docs[:5], 1):
+                logger.info(f"  {i}. {doc.metadata.get('title', 'Unknown')[:60]}")
+            
+            if not layer1_docs:
+                raise ValueError("No relevant papers found in Layer 1")
+            
+            # Evaluate Layer 1 results
+            eval1_start = time.time()
+            threshold1 = self.config['layer1']['confidence_threshold']
+            
+            evaluation1 = self.confidence_evaluator.evaluate(
+                query=query,
+                retrieved_docs=layer1_docs,
+                layer=1,
+                threshold=threshold1
+            )
+            
+            result['timings']['layer1_evaluation'] = time.time() - eval1_start
+            result['evaluations']['layer1'] = evaluation1
+            
+            logger.info(f"Layer 1 Evaluation:")
+            logger.info(f"  Confidence: {evaluation1['confidence']:.2f} (threshold: {threshold1})")
+            logger.info(f"  Should continue: {evaluation1['should_continue']}")
+            logger.info(f"  Reasoning: {evaluation1['reasoning'][:100]}...")
+            
+            # Early termination check
+            if not evaluation1['should_continue']:
+                logger.info("✓ Early termination: Layer 1 results sufficient")
+                result['final_docs'] = layer1_docs
+                result['final_confidence'] = evaluation1['confidence']
+                result['terminated_at'] = 'layer1'
+                result['timings']['total'] = time.time() - start_time
+                return result
+            
+            # ============================================================
+            # LAYER 2: Chunk-level retrieval
+            # ============================================================
+            logger.info("\n" + "="*60)
+            logger.info("LAYER 2: Chunk-level Retrieval")
+            logger.info("="*60)
+            
+            layer2_start = time.time()
+            
+            if not self.layer2.is_initialized:
+                raise ValueError("Layer 2 index not initialized")
+            
+            # Extract paper IDs from Layer 1 results
+            paper_ids = [doc.metadata['paper_id'] for doc in layer1_docs]
+            logger.info(f"Filtering by {len(paper_ids)} papers from Layer 1")
+            
+            k2 = self.config['layer2']['k_documents']
+            layer2_docs = self.layer2.search(
+                query=query,
+                k=k2,
+                filter_paper_ids=paper_ids
+            )
+            
+            result['timings']['layer2_retrieval'] = time.time() - layer2_start
+            result['layers_used'].append('layer2')
+            
+            logger.info(f"Retrieved {len(layer2_docs)} chunks")
+            for i, doc in enumerate(layer2_docs[:3], 1):
+                logger.info(f"  {i}. {doc.metadata.get('chunk_id', 'Unknown')[:60]}")
+            
+            if not layer2_docs:
+                logger.warning("No chunks found in Layer 2, using Layer 1 results")
+                result['final_docs'] = layer1_docs
+                result['final_confidence'] = evaluation1['confidence']
+                result['terminated_at'] = 'layer1_fallback'
+                result['timings']['total'] = time.time() - start_time
+                return result
+            
+            # Evaluate Layer 2 results
+            eval2_start = time.time()
+            threshold2 = self.config['layer2']['confidence_threshold']
+            
+            evaluation2 = self.confidence_evaluator.evaluate(
+                query=query,
+                retrieved_docs=layer2_docs,
+                layer=2,
+                threshold=threshold2
+            )
+            
+            result['timings']['layer2_evaluation'] = time.time() - eval2_start
+            result['evaluations']['layer2'] = evaluation2
+            
+            logger.info(f"Layer 2 Evaluation:")
+            logger.info(f"  Confidence: {evaluation2['confidence']:.2f} (threshold: {threshold2})")
+            logger.info(f"  Reasoning: {evaluation2['reasoning'][:100]}...")
+            
+            # ============================================================
+            # CONTEXT EXPANSION
+            # ============================================================
+            if self.config['expansion']['enabled']:
+                logger.info("\n" + "="*60)
+                logger.info("CONTEXT EXPANSION")
+                logger.info("="*60)
+                
+                expand_start = time.time()
+                
+                expanded_contexts = self.context_expander.expand(
+                    chunks=layer2_docs,
+                    confidence=evaluation2['confidence']
+                )
+                
+                result['timings']['expansion'] = time.time() - expand_start
+                result['expanded_contexts'] = expanded_contexts
+                
+                stats = self.context_expander.get_expansion_stats(evaluation2['confidence'])
+                logger.info(f"Expanded {len(expanded_contexts)} contexts")
+                logger.info(f"  Strategy: {stats['strategy']}")
+                logger.info(f"  Range: ±{stats['expansion_range']} chunks")
+            else:
+                result['expanded_contexts'] = [doc.page_content for doc in layer2_docs]
+            
+            # Final results
+            result['final_docs'] = layer2_docs
+            result['final_confidence'] = evaluation2['confidence']
+            result['terminated_at'] = 'layer2'
+            result['timings']['total'] = time.time() - start_time
+            
+            logger.info("\n" + "="*60)
+            logger.info(f"Retrieval Complete: {result['timings']['total']:.2f}s")
+            logger.info("="*60)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Hierarchical retrieval failed: {e}", exc_info=True)
+            return {
+                'status': 'error',
+                'message': str(e),
+                'query': query
+            }
+    
+    def _generate_answer(self, query: str, retrieval_result: Dict[str, Any]) -> str:
+        """
+        Generate answer using LLM (blocking)
+        
+        Args:
+            query: User query
+            retrieval_result: Results from hierarchical retrieval
+            
+        Returns:
+            Generated answer string
+        """
+        # Format context
+        if 'expanded_contexts' in retrieval_result:
+            contexts = retrieval_result['expanded_contexts']
+        else:
+            contexts = [doc.page_content for doc in retrieval_result['final_docs']]
+        
+        context_text = "\n\n".join([f"[Context {i+1}]\n{ctx}" for i, ctx in enumerate(contexts)])
+        
+        # Create prompt
+        prompt = f"""Based on the following research paper contexts, please answer the question.
+
+Question: {query}
+
+Contexts:
+{context_text}
+
+Please provide a comprehensive answer based on the contexts above. If the contexts don't contain enough information, acknowledge that.
+
+Answer:"""
+        
+        # Generate
+        try:
+            response = self.llm.invoke(prompt)
+            return response
+        except Exception as e:
+            logger.error(f"Answer generation failed: {e}")
+            return f"Error generating answer: {e}"
+    
+    def _generate_answer_stream(self, query: str, retrieval_result: Dict[str, Any]) -> Generator[str, None, None]:
+        """
+        Generate answer using LLM (streaming)
+        
+        Args:
+            query: User query
+            retrieval_result: Results from hierarchical retrieval
+            
+        Yields:
+            Answer chunks
+        """
+        # Format context
+        if 'expanded_contexts' in retrieval_result:
+            contexts = retrieval_result['expanded_contexts']
+        else:
+            contexts = [doc.page_content for doc in retrieval_result['final_docs']]
+        
+        context_text = "\n\n".join([f"[Context {i+1}]\n{ctx}" for i, ctx in enumerate(contexts)])
+        
+        # Create prompt
+        prompt = f"""Based on the following research paper contexts, please answer the question.
+
+Question: {query}
+
+Contexts:
+{context_text}
+
+Please provide a comprehensive answer based on the contexts above. If the contexts don't contain enough information, acknowledge that.
+
+Answer:"""
+        
+        # Generate with streaming
+        try:
+            for chunk in self.llm.stream(prompt):
+                yield chunk
+        except Exception as e:
+            logger.error(f"Streaming answer generation failed: {e}")
+            yield f"Error generating answer: {e}"
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get system statistics"""
+        return {
+            'layer1': self.layer1.get_stats(),
+            'layer2': self.layer2.get_stats(),
+            'config': self.config,
+            'initialized': self.layer1.is_initialized and self.layer2.is_initialized
+        }
+    
+    def is_ready(self) -> bool:
+        """Check if system is ready for queries"""
+        return self.layer1.is_initialized and self.layer2.is_initialized
