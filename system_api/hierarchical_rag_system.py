@@ -602,3 +602,105 @@ Answer:"""
     def is_ready(self) -> bool:
         """Check if system is ready for queries"""
         return self.layer1.is_initialized and self.layer2.is_initialized
+    
+    def check_and_update_indices(self, force_rebuild: bool = False) -> Dict[str, Any]:
+        """
+        智能檢查索引狀態並更新
+        
+        檢查項目：
+        1. 索引是否存在
+        2. 索引是否損壞
+        3. 是否有新增的 PDF
+        4. 索引的 PDF 數量是否匹配
+        
+        Args:
+            force_rebuild: 強制重建索引
+            
+        Returns:
+            操作結果字典
+        """
+        logger.info("="*80)
+        logger.info("Checking Index Status")
+        logger.info("="*80)
+        
+        result = {
+            'status': 'up_to_date',
+            'action_taken': None,
+            'details': {}
+        }
+        
+        # 檢查 1: 索引是否就緒
+        if not self.is_ready() or force_rebuild:
+            if force_rebuild:
+                logger.info("Force rebuild requested")
+                result['action_taken'] = 'rebuild'
+            else:
+                logger.warning("Indices not ready")
+                result['action_taken'] = 'build'
+            
+            build_result = self.build_indices()
+            result['status'] = build_result.get('status', 'error')
+            result['details'] = build_result
+            return result
+        
+        # 檢查 2: 獲取當前狀態
+        try:
+            stats1 = self.layer1.get_stats()
+            stats2 = self.layer2.get_stats()
+            current_pdfs = set(self._get_all_pdfs())
+            
+            indexed_count = stats1.get('paper_count', 0)
+            current_count = len(current_pdfs)
+            
+            logger.info(f"Current PDF files: {current_count}")
+            logger.info(f"Indexed papers: {indexed_count}")
+            
+            # 檢查 3: 數量不匹配 = 可能有新增或刪除
+            if current_count != indexed_count:
+                logger.warning(f"PDF count mismatch! Current: {current_count}, Indexed: {indexed_count}")
+                
+                if current_count > indexed_count:
+                    logger.info(f"Detected {current_count - indexed_count} new PDF(s)")
+                    result['action_taken'] = 'incremental_update'
+                else:
+                    logger.warning(f"Some PDFs were removed, rebuilding recommended")
+                    result['action_taken'] = 'rebuild'
+                
+                # 重建索引
+                build_result = self.build_indices()
+                result['status'] = build_result.get('status', 'error')
+                result['details'] = build_result
+                return result
+            
+            # 檢查 4: 驗證索引完整性（簡單檢查）
+            if not stats1.get('is_initialized') or not stats2.get('is_initialized'):
+                logger.error("Indices appear corrupted")
+                result['status'] = 'corrupted'
+                result['action_taken'] = 'rebuild'
+                
+                build_result = self.build_indices()
+                result['status'] = build_result.get('status', 'error')
+                result['details'] = build_result
+                return result
+            
+            # 全部檢查通過
+            logger.info("✓ Indices are up-to-date and healthy")
+            result['details'] = {
+                'layer1': stats1,
+                'layer2': stats2,
+                'pdf_count': current_count
+            }
+            
+        except Exception as e:
+            logger.error(f"Error checking indices: {e}")
+            result['status'] = 'error'
+            result['details']['error'] = str(e)
+            
+            # 嘗試重建
+            logger.info("Attempting to rebuild indices...")
+            result['action_taken'] = 'rebuild'
+            build_result = self.build_indices()
+            result['status'] = build_result.get('status', 'error')
+            result['details']['rebuild'] = build_result
+        
+        return result

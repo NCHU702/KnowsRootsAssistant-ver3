@@ -56,6 +56,21 @@ try:
         }
     )
     logger.info("✓ Hierarchical RAG System initialized successfully")
+    
+    # 智能檢查並更新索引
+    logger.info("Checking index status...")
+    check_result = rag_system.check_and_update_indices()
+    
+    if check_result['status'] == 'success':
+        if check_result['action_taken']:
+            logger.info(f"✓ Action taken: {check_result['action_taken']}")
+            logger.info(f"✓ Processed {check_result['details'].get('papers_processed', 0)} papers")
+        else:
+            logger.info("✓ Indices are up-to-date")
+    elif check_result['status'] == 'up_to_date':
+        logger.info("✓ Indices are healthy and up-to-date")
+    else:
+        logger.error(f"✗ Index check/update failed: {check_result.get('details', {}).get('error', 'Unknown error')}")
         
 except Exception as e:
     logger.error(f"Failed to initialize Hierarchical RAG System: {e}", exc_info=True)
@@ -1122,6 +1137,43 @@ def rag_mode():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/rag/rebuild', methods=['POST'])
+def rag_rebuild():
+    """
+    手動觸發索引重建或更新
+    
+    Query Parameters:
+        - force: true/false (是否強制完全重建)
+    
+    Returns:
+        - status: success/error
+        - action_taken: 執行的操作
+        - details: 詳細資訊
+    """
+    try:
+        if not rag_system:
+            return jsonify({'error': 'RAG system not initialized'}), 503
+        
+        force = request.args.get('force', 'false').lower() == 'true'
+        
+        logger.info(f"Manual index rebuild requested (force={force})")
+        
+        # 執行智能檢查並更新
+        result = rag_system.check_and_update_indices(force_rebuild=force)
+        
+        if result['status'] in ['success', 'up_to_date']:
+            return jsonify(result), 200
+        else:
+            return jsonify(result), 500
+        
+    except Exception as e:
+        logger.error(f"Rebuild failed: {e}", exc_info=True)
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+
 if __name__ == '__main__':
     print("\n" + "="*70)
     print("🚀 AI Agent Router Starting...")
@@ -1148,9 +1200,10 @@ if __name__ == '__main__':
     print(f"  Agent LLM: {'✓ Ready' if agent_llm else '✗ Failed'}")
     
     print("\n🌐 Monitoring Endpoints:")
-    print("  GET  /rag/stats  - System statistics")
-    print("  GET  /rag/health - Health check")
-    print("  GET  /rag/mode   - Current RAG mode info")
+    print("  GET  /rag/stats   - System statistics")
+    print("  GET  /rag/health  - Health check")
+    print("  GET  /rag/mode    - Current RAG mode info")
+    print("  POST /rag/rebuild - Rebuild indices (use ?force=true to force)")
     
     print("\n" + "="*70)
     print("Server running on http://localhost:4000")
