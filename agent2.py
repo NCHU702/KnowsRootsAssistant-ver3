@@ -36,7 +36,7 @@ rag_system = None
 
 try:
     rag_system = HierarchicalRAGSystem(
-        pdf_directory="./data",
+        pdf_directory="./test_data",
         model_name=model_name,
         embedding_model="quentinz/bge-large-zh-v1.5:latest",
         vectorstore_path="./vectorstore",   
@@ -46,7 +46,7 @@ try:
             'layer1': {
                 'k_documents': int(os.getenv('LAYER1_K_DOCUMENTS', '10')),
                 'confidence_threshold': float(os.getenv('LAYER1_THRESHOLD', '0.6')),
-                'similarity_threshold': 0.48  # 降低閾值以包含更多相關論文（L2距離轉換後的相似度較低）
+                'similarity_threshold': 0.5  # 降低閾值（純語義策略下需要更寬鬆）
             },
             'layer2': {
                 'k_documents': int(os.getenv('LAYER2_K_DOCUMENTS', '10')),
@@ -54,6 +54,23 @@ try:
             },
             'expansion': {
                 'enabled': os.getenv('ENABLE_EXPANSION', 'true').lower() == 'true'
+            },
+            'hybrid_search': {
+                'enabled': True,  # 啟用混合檢索
+                'semantic_weight': 0.9,  # 語義搜尋權重（主要依靠語義理解）
+                'keyword_weight': 0.1,   # 關鍵詞搜尋權重（輔助參考）
+                'use_jieba': True,       # 使用 jieba 中文分詞
+                'enable_smart_weighting': True,  # 啟用字典式智能權重（fallback）
+                'use_llm_analyzer': True,  # ✨ 啟用 LLM 自動分析詞彙（純語義策略）
+            },
+            'query_expansion': {
+                'enabled': False,  # 停用查詢擴展（LLM 分析器已足夠）
+                'min_word_count': 15,
+            },
+            'adaptive_weights': {
+                'enabled': False,  # 停用自適應權重（LLM 分析器已包含）
+                'default_semantic_weight': 0.9,
+                'default_keyword_weight': 0.1,
             },
             'performance': {
                 'cache_size': int(os.getenv('CACHE_SIZE', '10'))
@@ -136,19 +153,15 @@ def assistant_call(user_input: str) -> str:
     """
     AI assistant for paper summary, interpretation, translation, and retrieval
     
-    Note: This function is kept for Agent tool definition compatibility,
-    but in streaming mode (query_stream), the RAG system is called directly
-    via rag_system.query_stream() for better UX. This non-streaming version
-    is only used as a fallback if streaming fails.
+    Note: This function returns a placeholder immediately in streaming mode.
+    The actual RAG retrieval is intercepted and handled by query_stream endpoint
+    to enable real-time streaming of results.
     """
     logger.info(f"Assistant Call invoked with: '{user_input}'")
     
-    # Use RAG system for queries (non-streaming fallback)
-    if rag_system:
-        logger.info("Using RAG system for query (non-streaming fallback)")
-        return rag_system.query(user_input)
-    else:
-        return "RAG system not available. Please check system status."
+    # Return empty string immediately - streaming will handle the actual response
+    # This prevents duplicate RAG calls and enables proper streaming
+    return ""
 
 
 def web_search_call(user_input: str) -> str:
@@ -402,11 +415,13 @@ def query_stream():
                             # If action is AssistantCall, start streaming the RAG output
                             if event['tool'] == 'AssistantCall' and rag_system:
                                 try:
+                                    logger.info(f"🔄 Intercepting AssistantCall - starting RAG streaming for: {event.get('input', user_input)}")
                                     yield f"data: {json.dumps({'type': 'tool_start', 'tool': 'AssistantCall'})}\n\n"
                                     
                                     action_input = event.get('input', user_input)
                                     rag_stream = rag_system.query_stream(action_input)
                                     
+                                    chunk_count = 0
                                     for chunk in rag_stream:
                                         # Check stop signal during RAG streaming
                                         if stop_event.is_set():
@@ -420,7 +435,9 @@ def query_stream():
                                         if chunk:
                                             yield f"data: {json.dumps({'type': 'tool_token', 'tool': 'AssistantCall', 'content': chunk})}\n\n"
                                             final_answer_buffer += chunk
+                                            chunk_count += 1
                                     
+                                    logger.info(f"✓ RAG streaming completed: {chunk_count} chunks streamed")
                                     final_answer_started = True
                                 except GeneratorExit:
                                     # Client disconnected during RAG streaming

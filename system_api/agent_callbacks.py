@@ -51,7 +51,7 @@ class AgentStreamCallback(BaseCallbackHandler):
                 'input': str(tool_input)
             })
             
-            logger.debug(f"Agent action: {tool_name}")
+            logger.info(f"🎯 Agent action detected: {tool_name} with input: {str(tool_input)[:100]}")
             
         except Exception as e:
             logger.error(f"Error in on_agent_action: {e}")

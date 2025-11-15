@@ -23,6 +23,9 @@ from system_api.layer2_vectorstore import Layer2VectorStore
 from system_api.confidence_evaluator import ConfidenceEvaluator
 from system_api.context_expander import ContextExpander
 from system_api.progress_embeddings import ProgressEmbeddings
+from system_api.hybrid_retriever import HybridRetriever
+from system_api.query_expander import QueryExpander
+from system_api.adaptive_weights import AdaptiveWeightAdjuster
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +48,22 @@ HIERARCHICAL_RAG_CONFIG = {
             'medium': 2,  # ±2 chunks when 0.75 ≤ confidence < 0.85
             'low': 3      # ±3 chunks when confidence < 0.75
         }
+    },
+    'hybrid_search': {
+        'enabled': True,  # 啟用混合檢索
+        'semantic_weight': 0.5,  # 語義搜尋權重 (0-1)
+        'keyword_weight': 0.5,   # 關鍵詞搜尋權重 (0-1)
+        'use_jieba': True,       # 使用 jieba 中文分詞
+        'enable_smart_weighting': True,  # 啟用智能詞彙權重
+    },
+    'query_expansion': {
+        'enabled': True,  # 啟用查詢擴展
+        'min_word_count': 5,  # 少於此詞數才擴展
+    },
+    'adaptive_weights': {
+        'enabled': True,  # 啟用自適應權重調整
+        'default_semantic_weight': 0.5,
+        'default_keyword_weight': 0.5,
     },
     'performance': {
         'use_cache': True,
@@ -135,10 +154,70 @@ class HierarchicalRAGSystem:
         self.confidence_evaluator = ConfidenceEvaluator(self.evaluation_llm)
         self.context_expander = ContextExpander(self.layer2)
         
+        # Query expansion and adaptive weights
+        self.query_expander: Optional[QueryExpander] = None
+        self.weight_adjuster: Optional[AdaptiveWeightAdjuster] = None
+        
+        # Initialize query expander if enabled
+        if self.config.get('query_expansion', {}).get('enabled', False):
+            self.query_expander = QueryExpander(
+                llm=self.llm,
+                min_word_count=self.config['query_expansion'].get('min_word_count', 5)
+            )
+            logger.info("✓ Query Expander initialized")
+        
+        # Initialize adaptive weight adjuster if enabled
+        if self.config.get('adaptive_weights', {}).get('enabled', False):
+            aw_config = self.config['adaptive_weights']
+            self.weight_adjuster = AdaptiveWeightAdjuster(
+                default_semantic_weight=aw_config.get('default_semantic_weight', 0.5),
+                default_keyword_weight=aw_config.get('default_keyword_weight', 0.5)
+            )
+            logger.info("✓ Adaptive Weight Adjuster initialized")
+        
+        # Hybrid retriever (initialized after loading indices)
+        self.hybrid_retriever: Optional[HybridRetriever] = None
+        
         # Try to load existing indices
         self._load_indices()
         
+        # Initialize hybrid retriever if enabled
+        if self.config.get('hybrid_search', {}).get('enabled', False):
+            self._initialize_hybrid_retriever()
+        
         logger.info("Hierarchical RAG System initialized successfully")
+    
+    def _initialize_hybrid_retriever(self):
+        """初始化混合檢索器"""
+        try:
+            hybrid_config = self.config.get('hybrid_search', {})
+            use_jieba = hybrid_config.get('use_jieba', True)
+            enable_smart_weighting = hybrid_config.get('enable_smart_weighting', True)
+            
+            use_llm_analyzer = hybrid_config.get('use_llm_analyzer', True)
+            
+            logger.info("初始化混合檢索器 (Hybrid Retriever)...")
+            logger.info(f"  語義權重: {hybrid_config.get('semantic_weight', 0.5):.2f}")
+            logger.info(f"  關鍵詞權重: {hybrid_config.get('keyword_weight', 0.5):.2f}")
+            logger.info(f"  中文分詞: {'啟用' if use_jieba else '停用'}")
+            logger.info(f"  智能權重（字典）: {'啟用' if enable_smart_weighting else '停用'}")
+            logger.info(f"  LLM 詞彙分析: {'啟用' if use_llm_analyzer else '停用'}")
+            
+            self.hybrid_retriever = HybridRetriever(
+                layer1_vectorstore=self.layer1,
+                use_jieba=use_jieba,
+                build_index_on_init=True,  # 自動建立 BM25 索引
+                enable_smart_weighting=enable_smart_weighting,  # 字典式智能權重
+                llm=self.llm,  # 傳遞 LLM 給分析器
+                use_llm_analyzer=use_llm_analyzer  # 啟用 LLM 自動分析
+            )
+            
+            logger.info("✓ 混合檢索器初始化成功")
+            
+        except Exception as e:
+            logger.error(f"混合檢索器初始化失敗: {e}", exc_info=True)
+            logger.warning("將回退到純語義搜尋")
+            self.hybrid_retriever = None
     
     def _load_indices(self):
         """Load existing vector store indices"""
@@ -365,12 +444,71 @@ class HierarchicalRAGSystem:
         result = {
             'status': 'success',
             'query': query,
+            'original_query': query,  # Save original query
             'layers_used': [],
             'timings': {},
             'evaluations': {}
         }
         
         try:
+            # ============================================================
+            # STEP 0: Query Enhancement (Expansion + Weight Adjustment)
+            # ============================================================
+            expansion_used = False
+            weight_adjustment_used = False
+            weight_reason = ""
+            
+            # Query Expansion
+            if self.query_expander and self.config.get('query_expansion', {}).get('enabled', False):
+                logger.info("="*60)
+                logger.info("查詢擴展 (Query Expansion)")
+                logger.info("="*60)
+                
+                expansion_start = time.time()
+                expanded_query = self.query_expander.expand(query)
+                result['timings']['query_expansion'] = time.time() - expansion_start
+                
+                if expanded_query != query:
+                    logger.info(f"✓ 查詢已擴展:")
+                    logger.info(f"  原始: {query}")
+                    logger.info(f"  擴展: {expanded_query}")
+                    query = expanded_query
+                    expansion_used = True
+                    result['expanded_query'] = expanded_query
+                else:
+                    logger.info("ℹ️  查詢無需擴展（詞數充足）")
+            
+            # Adaptive Weight Adjustment
+            semantic_weight = self.config['hybrid_search'].get('semantic_weight', 0.5)
+            keyword_weight = self.config['hybrid_search'].get('keyword_weight', 0.5)
+            
+            if self.weight_adjuster and self.config.get('adaptive_weights', {}).get('enabled', False):
+                logger.info("="*60)
+                logger.info("自適應權重調整 (Adaptive Weights)")
+                logger.info("="*60)
+                
+                weight_start = time.time()
+                semantic_weight, keyword_weight, weight_reason = self.weight_adjuster.adjust_weights(query)
+                result['timings']['weight_adjustment'] = time.time() - weight_start
+                
+                logger.info(f"✓ 權重已調整:")
+                logger.info(f"  語義權重: {semantic_weight:.2f}")
+                logger.info(f"  關鍵詞權重: {keyword_weight:.2f}")
+                logger.info(f"  調整原因: {weight_reason}")
+                
+                weight_adjustment_used = True
+                result['adjusted_weights'] = {
+                    'semantic': semantic_weight,
+                    'keyword': keyword_weight,
+                    'reason': weight_reason
+                }
+            
+            # Store enhancement metadata
+            result['enhancements'] = {
+                'expansion_used': expansion_used,
+                'weight_adjustment_used': weight_adjustment_used
+            }
+            
             # ============================================================
             # LAYER 1: Paper-level retrieval
             # ============================================================
@@ -386,13 +524,28 @@ class HierarchicalRAGSystem:
             k1 = self.config['layer1']['k_documents']
             similarity_threshold = self.config['layer1'].get('similarity_threshold')
             
-            # 使用 search_with_scores 來獲取相似度分數
-            # 注意：當有 similarity_threshold 時，k 只是用於初始檢索數量，實際返回數量由閾值決定
-            layer1_results_with_scores = self.layer1.search_with_scores(
-                query, 
-                k=k1,  # 當有閾值時，這個參數不影響最終返回數量
-                score_threshold=similarity_threshold
-            )
+            # 判斷使用混合檢索還是純語義搜尋
+            if self.hybrid_retriever and self.config.get('hybrid_search', {}).get('enabled', False):
+                # 使用混合檢索 (語義 + 關鍵詞) with adjusted weights
+                logger.info("使用混合檢索 (Hybrid Search: 語義 + 關鍵詞)")
+                logger.info(f"  當前權重: 語義={semantic_weight:.2f}, 關鍵詞={keyword_weight:.2f}")
+                
+                layer1_results_with_scores = self.hybrid_retriever.hybrid_search(
+                    query=query,
+                    k=k1,
+                    semantic_weight=semantic_weight,
+                    keyword_weight=keyword_weight,
+                    score_threshold=similarity_threshold,
+                    return_scores_breakdown=False
+                )
+            else:
+                # 使用純語義搜尋
+                logger.info("使用純語義搜尋 (Semantic Search)")
+                layer1_results_with_scores = self.layer1.search_with_scores(
+                    query=query, 
+                    k=k1,
+                    score_threshold=similarity_threshold
+                )
             
             # 提取文檔（用於後續處理）
             layer1_docs = [doc for doc, score in layer1_results_with_scores]
