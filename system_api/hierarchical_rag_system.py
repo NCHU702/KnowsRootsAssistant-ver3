@@ -22,6 +22,7 @@ from system_api.layer1_vectorstore import Layer1VectorStore
 from system_api.layer2_vectorstore import Layer2VectorStore
 from system_api.confidence_evaluator import ConfidenceEvaluator
 from system_api.context_expander import ContextExpander
+from system_api.progress_embeddings import ProgressEmbeddings
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +30,9 @@ logger = logging.getLogger(__name__)
 # Configuration
 HIERARCHICAL_RAG_CONFIG = {
     'layer1': {
-        'k_documents': 15,  # Number of papers to retrieve
+        'k_documents': 15,  # Maximum number of papers to retrieve
         'confidence_threshold': 0.7,  # Early termination threshold
+        'similarity_threshold': None,  # Optional: Only retrieve papers with similarity >= threshold (0-1)
     },
     'layer2': {
         'k_documents': 10,  # Number of chunks to retrieve
@@ -209,7 +211,11 @@ class HierarchicalRAGSystem:
                     paper_id=paper_id
                 )
                 
+                # Add simple metadata (use filename as title)
                 if abstract_result:
+                    abstract_result['title'] = paper_id
+                    abstract_result['authors'] = []
+                    abstract_result['year'] = None
                     abstracts.append(abstract_result)
                     logger.info(f"  ✓ Abstract: {abstract_result['source']} (confidence: {abstract_result['confidence']:.2f})")
                 
@@ -313,6 +319,9 @@ class HierarchicalRAGSystem:
         if result['status'] == 'error':
             return f"Error: {result['message']}"
         
+        if result['status'] == 'no_results':
+            return "抱歉，沒有找到與您的問題相關的論文。請嘗試使用不同的關鍵字或降低相似度閾值。"
+        
         # Generate answer using LLM
         return self._generate_answer(query, result)
     
@@ -331,6 +340,10 @@ class HierarchicalRAGSystem:
         
         if result['status'] == 'error':
             yield f"Error: {result['message']}"
+            return
+        
+        if result['status'] == 'no_results':
+            yield "抱歉，沒有找到與您的問題相關的論文。請嘗試使用不同的關鍵字或降低相似度閾值。"
             return
         
         # Generate answer with streaming
@@ -371,17 +384,35 @@ class HierarchicalRAGSystem:
                 raise ValueError("Layer 1 index not initialized")
             
             k1 = self.config['layer1']['k_documents']
-            layer1_docs = self.layer1.search(query, k=k1)
+            similarity_threshold = self.config['layer1'].get('similarity_threshold')
+            
+            # 使用 search_with_scores 來獲取相似度分數
+            # 注意：當有 similarity_threshold 時，k 只是用於初始檢索數量，實際返回數量由閾值決定
+            layer1_results_with_scores = self.layer1.search_with_scores(
+                query, 
+                k=k1,  # 當有閾值時，這個參數不影響最終返回數量
+                score_threshold=similarity_threshold
+            )
+            
+            # 提取文檔（用於後續處理）
+            layer1_docs = [doc for doc, score in layer1_results_with_scores]
             
             result['timings']['layer1_retrieval'] = time.time() - layer1_start
             result['layers_used'].append('layer1')
+            result['layer1_docs'] = layer1_docs  # Save Layer 1 docs for reference display
+            result['layer1_scores'] = [score for doc, score in layer1_results_with_scores]  # Save scores for display
             
-            logger.info(f"Retrieved {len(layer1_docs)} papers")
-            for i, doc in enumerate(layer1_docs[:5], 1):
-                logger.info(f"  {i}. {doc.metadata.get('title', 'Unknown')[:60]}")
+            logger.info(f"Retrieved {len(layer1_docs)} papers"
+                       f"{f' (threshold: {similarity_threshold:.2f})' if similarity_threshold else ''}")
+            for i, (doc, score) in enumerate(layer1_results_with_scores[:5], 1):
+                logger.info(f"  {i}. {doc.metadata.get('title', 'Unknown')[:60]} (similarity: {score:.3f})")
             
             if not layer1_docs:
-                raise ValueError("No relevant papers found in Layer 1")
+                logger.warning("No relevant papers found in Layer 1")
+                result['status'] = 'no_results'
+                result['message'] = 'No relevant papers found matching your query.'
+                result['timings']['total'] = time.time() - start_time
+                return result
             
             # Evaluate Layer 1 results
             eval1_start = time.time()
@@ -521,8 +552,34 @@ class HierarchicalRAGSystem:
             retrieval_result: Results from hierarchical retrieval
             
         Returns:
-            Generated answer string
+            Generated answer string with paper references
         """
+        # Detect if query is in Chinese
+        def is_chinese(text: str) -> bool:
+            """Check if text contains significant Chinese characters"""
+            chinese_chars = sum(1 for char in text if '\u4e00' <= char <= '\u9fff')
+            return chinese_chars > len(text) * 0.3
+        
+        is_chinese_query = is_chinese(query)
+        
+        # Extract paper information from Layer 1 results with similarity scores
+        referenced_papers = []
+        if 'layers_used' in retrieval_result and 'layer1' in retrieval_result.get('layers_used', []):
+            # Get paper metadata and scores from retrieval result
+            layer1_docs = retrieval_result.get('layer1_docs', [])
+            layer1_scores = retrieval_result.get('layer1_scores', [])
+            
+            for i, doc in enumerate(layer1_docs[:10]):  # Limit to top 10 papers
+                metadata = doc.metadata
+                title = metadata.get('title', 'Unknown Title')
+                
+                # Add similarity score if available
+                if i < len(layer1_scores):
+                    score = layer1_scores[i]
+                    referenced_papers.append(f"- {title} (相似度: {score:.3f})")
+                else:
+                    referenced_papers.append(f"- {title}")
+        
         # Format context
         if 'expanded_contexts' in retrieval_result:
             contexts = retrieval_result['expanded_contexts']
@@ -531,8 +588,23 @@ class HierarchicalRAGSystem:
         
         context_text = "\n\n".join([f"[Context {i+1}]\n{ctx}" for i, ctx in enumerate(contexts)])
         
-        # Create prompt
-        prompt = f"""Based on the following research paper contexts, please answer the question.
+        # Create prompt based on language
+        if is_chinese_query:
+            prompt = f"""你是一個學術研究助手。請根據以下研究論文的內容回答問題。
+
+【重要】請務必使用「繁體中文（Traditional Chinese）」回答，不要使用簡體中文。
+
+問題：{query}
+
+參考文獻內容：
+{context_text}
+
+請根據以上內容提供完整的答案。如果內容不足以回答問題，請明確說明。
+記住：回答必須使用繁體中文，例如「應用」而非「应用」，「資料」而非「数据」。
+
+回答："""
+        else:
+            prompt = f"""Based on the following research paper contexts, please answer the question.
 
 Question: {query}
 
@@ -546,6 +618,15 @@ Answer:"""
         # Generate
         try:
             response = self.llm.invoke(prompt)
+            
+            # Prepend referenced papers list
+            if referenced_papers:
+                if is_chinese_query:
+                    paper_list = "📚 參考論文：\n" + "\n".join(referenced_papers) + "\n\n" + "="*60 + "\n\n"
+                else:
+                    paper_list = "📚 Referenced Papers:\n" + "\n".join(referenced_papers) + "\n" + "="*60 + "\n"
+                response = paper_list + response
+            
             return response
         except Exception as e:
             logger.error(f"Answer generation failed: {e}")
@@ -560,8 +641,46 @@ Answer:"""
             retrieval_result: Results from hierarchical retrieval
             
         Yields:
-            Answer chunks
+            Answer chunks with paper references
         """
+        # Detect if query is in Chinese
+        def is_chinese(text: str) -> bool:
+            """Check if text contains significant Chinese characters"""
+            chinese_chars = sum(1 for char in text if '\u4e00' <= char <= '\u9fff')
+            return chinese_chars > len(text) * 0.3
+        
+        is_chinese_query = is_chinese(query)
+        
+        # Extract paper information from Layer 1 results with similarity scores
+        referenced_papers = []
+        if 'layers_used' in retrieval_result and 'layer1' in retrieval_result.get('layers_used', []):
+            # Get paper metadata and scores from retrieval result
+            layer1_docs = retrieval_result.get('layer1_docs', [])
+            layer1_scores = retrieval_result.get('layer1_scores', [])
+            
+            for i, doc in enumerate(layer1_docs[:10]):  # Limit to top 10 papers
+                metadata = doc.metadata
+                title = metadata.get('title', 'Unknown Title')
+                
+                # Add similarity score if available
+                if i < len(layer1_scores):
+                    score = layer1_scores[i]
+                    referenced_papers.append(f"- {title} (相似度: {score:.3f})")
+                else:
+                    referenced_papers.append(f"- {title}")
+        
+        # Yield referenced papers first
+        if referenced_papers:
+            if is_chinese_query:
+                yield "📚 參考論文：\n"
+            else:
+                yield "📚 Referenced Papers:\n"
+            
+            for paper in referenced_papers:
+                yield paper + "\n"
+            
+            yield "\n" + "="*60 + "\n\n"
+        
         # Format context
         if 'expanded_contexts' in retrieval_result:
             contexts = retrieval_result['expanded_contexts']
@@ -570,8 +689,23 @@ Answer:"""
         
         context_text = "\n\n".join([f"[Context {i+1}]\n{ctx}" for i, ctx in enumerate(contexts)])
         
-        # Create prompt
-        prompt = f"""Based on the following research paper contexts, please answer the question.
+        # Create prompt based on language
+        if is_chinese_query:
+            prompt = f"""你是一個學術研究助手。請根據以下研究論文的內容回答問題。
+
+【重要】請務必使用「繁體中文（Traditional Chinese）」回答，不要使用簡體中文。
+
+問題：{query}
+
+參考文獻內容：
+{context_text}
+
+請根據以上內容提供完整的答案。如果內容不足以回答問題，請明確說明。
+記住：回答必須使用繁體中文，例如「應用」而非「应用」，「資料」而非「数据」。
+
+回答："""
+        else:
+            prompt = f"""Based on the following research paper contexts, please answer the question.
 
 Question: {query}
 

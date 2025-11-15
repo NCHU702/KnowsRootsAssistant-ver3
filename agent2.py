@@ -20,7 +20,7 @@ from system_api.database_updater import DatabaseUpdater
 from system_api.pdf_storage import PDFStorage
 from system_api.hierarchical_rag_system import HierarchicalRAGSystem
 from collections import Counter
-model_name = "gemma3:12b"
+model_name = "jcai/llama-3-taiwan-8b-instruct:q4_k_m"
 
 # Set up logging for debugging
 logging.basicConfig(level=logging.INFO)
@@ -38,14 +38,19 @@ try:
     rag_system = HierarchicalRAGSystem(
         pdf_directory="./data",
         model_name=model_name,
-        embedding_model="embeddinggemma:latest",
-        vectorstore_path="./vectorstore",
+        embedding_model="quentinz/bge-large-zh-v1.5:latest",
+        vectorstore_path="./vectorstore",   
         chunk_size=800,
         chunk_overlap=100,
         config={
-            'thresholds': {
-                'layer1': float(os.getenv('LAYER1_THRESHOLD', '0.7')),
-                'layer2': float(os.getenv('LAYER2_THRESHOLD', '0.8'))
+            'layer1': {
+                'k_documents': int(os.getenv('LAYER1_K_DOCUMENTS', '10')),
+                'confidence_threshold': float(os.getenv('LAYER1_THRESHOLD', '0.6')),
+                'similarity_threshold': 0.48  # 降低閾值以包含更多相關論文（L2距離轉換後的相似度較低）
+            },
+            'layer2': {
+                'k_documents': int(os.getenv('LAYER2_K_DOCUMENTS', '10')),
+                'confidence_threshold': float(os.getenv('LAYER2_THRESHOLD', '0.8'))
             },
             'expansion': {
                 'enabled': os.getenv('ENABLE_EXPANSION', 'true').lower() == 'true'
@@ -128,12 +133,19 @@ print('Initializing WebSearcher...')
 web_searcher = WebSearcher(agent_llm)
 
 def assistant_call(user_input: str) -> str:
-    """AI assistant for paper summary, interpretation, translation, and retrieval"""
+    """
+    AI assistant for paper summary, interpretation, translation, and retrieval
+    
+    Note: This function is kept for Agent tool definition compatibility,
+    but in streaming mode (query_stream), the RAG system is called directly
+    via rag_system.query_stream() for better UX. This non-streaming version
+    is only used as a fallback if streaming fails.
+    """
     logger.info(f"Assistant Call invoked with: '{user_input}'")
     
-    # Use RAG system for queries
+    # Use RAG system for queries (non-streaming fallback)
     if rag_system:
-        logger.info("Using RAG system for query")
+        logger.info("Using RAG system for query (non-streaming fallback)")
         return rag_system.query(user_input)
     else:
         return "RAG system not available. Please check system status."
@@ -152,13 +164,13 @@ tools = [
     Tool(
         name="AssistantCall",
         func=assistant_call,
-        description="Use this for paper summary, interpretation, or translation tasks. Best for analyzing or processing academic content, such as summarizing, translating, or explaining documents."
+        description="Use this for ALL paper-related queries including searching, summarizing, analyzing, translating, or explaining academic papers from the local database. This is the PRIMARY tool for any research paper questions unless the user explicitly requests internet search or mentions 'online', 'web search', or 'latest from internet'."
     ),
 
     Tool(
         name="WebSearchCall",
         func=web_search_call,
-        description="Use this for web scraping, searching the internet for recent or latest information, including top academic papers on specific topics from 2024 or 2025, or finding online resources. Do not use invented tools like PaperSearch; use this for any online paper searches."
+        description="ONLY use this when the user EXPLICITLY requests web/internet search with keywords like 'search online', 'search the web', 'find on internet', 'search internet', or 'web search'. Do NOT use this for general paper queries - those should use AssistantCall."
     )
 ]
 
@@ -174,41 +186,64 @@ Use the following format:
 
 Question: the input question you must answer
 Thought: you should always think about what to do
-Action: the action to take, should be exactly one of [{tool_names}]. Do not invent new tool names like PaperSearch.
+Action: the action to take, should be exactly one of [{tool_names}]
 Action Input: the input to the action
 Observation: the result of the action
 ... (this Thought/Action/Action Input/Observation can repeat N times)
 Thought: I now know the final answer
 Final Answer: the final answer to the original input question
 
+IMPORTANT ROUTING RULES:
+1. DEFAULT to AssistantCall for ALL paper-related queries (search, summarize, analyze, find papers, etc.)
+2. ONLY use WebSearchCall when user EXPLICITLY mentions: "search online", "search web", "find on internet", "search internet", "web search"
+3. Year mentions (2024, 2025) alone do NOT mean web search - use AssistantCall unless explicitly requested
+
 Here are some examples:
 
-Example 1:
-Question: Summarize a research paper on AI
-Thought: This requires summarizing academic content, so I should use AssistantCall.
+Example 1 - Summarization (Use AssistantCall):
+Question: Summarize research papers on deep learning
+Thought: This is asking to summarize papers. I should search and analyze papers from local database.
 Action: AssistantCall
-Action Input: Summarize the AI paper
-Observation: [some summary]
+Action Input: Summarize research papers on deep learning
+Observation: [summary from local papers]
 Thought: I now know the final answer
-Final Answer: The summary is...
+Final Answer: Here are the summaries of deep learning papers from our database...
 
-Example 2:
-Question: Find old papers on machine learning
-Thought: This is for searching local database for older papers, so use RetrievalCall.
-Action: RetrievalCall
-Action Input: machine learning
-Observation: [list of papers]
+Example 2 - Finding Papers (Use AssistantCall):
+Question: Find papers about transformer architectures
+Thought: User wants to find papers. No explicit mention of web search, so I should search local database.
+Action: AssistantCall
+Action Input: Find papers about transformer architectures
+Observation: [list of papers from database]
 Thought: I now know the final answer
-Final Answer: Here are the papers...
+Final Answer: Here are the papers about transformer architectures...
 
-Example 3:
-Question: Search for 2024 papers on remote sensing
-Thought: This requires internet search for recent papers, so use WebSearchCall. Do not use RetrievalCall for recent years.
+Example 3 - Year-based Query (Use AssistantCall):
+Question: What are the main research topics in 2024 papers?
+Thought: User mentions 2024 but doesn't explicitly request web search. I should query local database.
+Action: AssistantCall
+Action Input: What are the main research topics in 2024 papers?
+Observation: [analysis of 2024 papers in database]
+Thought: I now know the final answer
+Final Answer: Based on our 2024 papers, the main research topics are...
+
+Example 4 - EXPLICIT Web Search (Use WebSearchCall):
+Question: Search the internet for latest papers on quantum computing
+Thought: User explicitly said "search the internet", so I must use WebSearchCall.
 Action: WebSearchCall
-Action Input: top remote sensing papers 2024
-Observation: [search results]
+Action Input: latest papers on quantum computing
+Observation: [web search results]
 Thought: I now know the final answer
-Final Answer: Here are the top papers...
+Final Answer: Here are the latest papers from internet search...
+
+Example 5 - Translation/Analysis (Use AssistantCall):
+Question: Explain the methodology used in machine learning papers
+Thought: This requires analyzing papers from our database.
+Action: AssistantCall
+Action Input: Explain the methodology used in machine learning papers
+Observation: [analysis from local papers]
+Thought: I now know the final answer
+Final Answer: The common methodologies in our papers include...
 
 If the query looks like previous agent output or contains terms like Thought: or Action:, treat it as text to summarize and use AssistantCall.
 
@@ -460,105 +495,8 @@ def query_stream():
         logger.error(f"Error in query_stream: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/query', methods=['POST'])
-def query():
-    try:
-        user_input = request.json.get('input', '')
-        
-        if not user_input:
-            return jsonify({'error': 'No input provided'}), 400
-        
-        user_input_lower = user_input.lower()
-        if all(keyword in user_input_lower for keyword in ['question:', 'thought:', 'action:']):
-            logger.warning("Detected agent format in input, using fallback routing")
-            return fallback_routing(user_input)
-        
-        if not agent_executor:
-            # Fallback to direct routing if agent not available
-            logger.warning("Agent not available, using fallback routing")
-            return fallback_routing(user_input)
-        
-        logger.info(f"Processing query: {user_input}")
-        
-        # Execute the agent with error handling
-        try:
-            response = agent_executor.invoke({"input": user_input})
-            
-            # Robustly extract action taken and action input from intermediate steps
-            action_taken = "Direct Response"
-            action_input = None
-            try:
-                steps = response.get('intermediate_steps', []) if isinstance(response, dict) else []
-                for step in steps:
-                    if not step:
-                        continue
-                    first = step[0]
-                    # support both objects and dict-like entries
-                    tool_name = None
-                    tool_input = None
-                    if hasattr(first, 'tool'):
-                        tool_name = getattr(first, 'tool', None)
-                    elif isinstance(first, dict):
-                        tool_name = first.get('tool') or first.get('name')
-                    
-                    if hasattr(first, 'tool_input'):
-                        tool_input = getattr(first, 'tool_input', None)
-                    elif isinstance(first, dict):
-                        tool_input = first.get('tool_input') or first.get('input')
-                    
-                    if tool_name:
-                        action_taken = tool_name
-                        action_input = tool_input
-                        break
-            except Exception:
-                logger.debug("Failed to parse intermediate_steps", exc_info=True)
-            
-            output_text = response.get('output', '') if isinstance(response, dict) else str(response)
-            
-            # If agent used AssistantCall tool, ensure we return assistant_call's result (more consistent format)
-            if action_taken == 'AssistantCall':
-                logger.info("Agent used AssistantCall - invoking assistant_call to get canonical assistant output")
-                try:
-                    # prefer the tool's input if available, otherwise use the original user input
-                    assist_input = action_input if action_input else user_input
-                    assistant_result = assistant_call(assist_input)
-                    output_text = assistant_result
-                except Exception as e:
-                    logger.warning(f"assistant_call failed while honoring Agent's AssistantCall: {e}")
-            
-            # If agent used WebSearchCall but user asked for summarization/analysis, prefer AssistantCall
-            # elif action_taken == 'WebSearchCall':
-            #     summarize_keywords = ['summarize', 'summary', 'explain', 'interpret', 'translate', 'abstract', 'conclude']
-            #     if any(k in user_input.lower() for k in summarize_keywords):
-            #         logger.info("User intent appears to be summarization/analysis; calling assistant_call instead of web search output")
-            #         try:
-            #             assistant_result = assistant_call(user_input)
-            #             output_text = assistant_result
-            #             action_taken = 'AssistantCall (Forced)'
-            #         except Exception as e:
-            #             logger.warning(f"assistant_call failed when forced after WebSearchCall: {e}")
-            
-            # Detect clearly invalid agent outputs and fallback if necessary
-            if not output_text or "stopped due to" in output_text.lower() or "invalid format" in output_text.lower():
-                logger.warning("Agent output indicates failure; falling back to routing")
-                return fallback_routing(user_input)
-            
-            logger.info(f"Action taken: {action_taken}")
-            logger.info(f"Output length: {len(output_text)} chars")
-            
-            return jsonify({
-                'action': action_taken,
-                'output': output_text
-            })
-            
-        except Exception as agent_error:
-            logger.error(f"Agent execution error: {agent_error}")
-            # Fallback to simple routing based on keywords
-            return fallback_routing(user_input)
-    
-    except Exception as e:
-        logger.error(f"Request error: {e}")
-        return jsonify({'error': str(e)}), 500
+# Note: Non-streaming /query endpoint has been removed. 
+# All queries now use streaming mode via /query_stream for better UX.
 
 @app.route('/inheritance_catalog', methods=['GET'])
 def inheritance_catalog():
@@ -702,7 +640,13 @@ def inheritance_query():
         return jsonify({'error': str(e)}), 500
 
 def fallback_routing(user_input):
-    """Bag-of-words based routing as fallback using numpy for cosine similarity"""
+    """
+    Bag-of-words based routing as fallback using numpy for cosine similarity
+    
+    Note: This function is no longer actively used since /query endpoint was removed.
+    It's kept for backward compatibility and potential emergency fallback scenarios.
+    In normal operation, all requests go through /query_stream with streaming.
+    """
     
     def compute_bow_similarity(query, docs):
         def tokenize(text):
@@ -738,12 +682,12 @@ def fallback_routing(user_input):
     
     tool_map = {
         'AssistantCall': {
-            'desc': "Handle tasks involving summarization, translation, interpretation, or detailed analysis of academic content, papers, or documents. Use when the query asks to explain, summarize, or process existing information.",
+            'desc': "Primary tool for ALL paper-related tasks including searching papers, summarization, translation, interpretation, analysis, finding papers by topic or year, explaining methodologies, and any academic content queries from local database. Use for general paper questions, research queries, and document analysis.",
             'func': assistant_call
         },
 
         'WebSearchCall': {
-            'desc': "Perform web searches for recent information, latest or top academic papers on specific topics, online resources, news, or real-time data from the internet. Use for queries about current events, new research in 2024 or 2025, or anything requiring up-to-date web content.",
+            'desc': "Only for explicit web/internet search requests with keywords: search online, search web, find on internet, search internet, web search, online search. Do NOT use for general paper queries or year-based searches unless explicitly requested to search online.",
             'func': web_search_call
         }
     }

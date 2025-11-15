@@ -104,16 +104,25 @@ class Layer1VectorStore:
                 return False
             
             logger.info(f"Creating FAISS index with {len(documents)} abstracts...")
+            estimated_time = len(documents) * 1.0 / 60  # 假設每個 abstract 1 秒
+            logger.info(f"⏳ Generating {len(documents)} embeddings using Ollama...")
+            logger.info(f"   Estimated time: {estimated_time:.1f} minutes")
             
-            # Use progress wrapper for real-time updates
-            from system_api.progress_embeddings import ProgressEmbeddings
-            progress_embeddings = ProgressEmbeddings(self.embeddings, label="Layer 1")
+            # Create FAISS index
+            embed_start = time.time()
             
-            # Create FAISS index with progress tracking
-            self.vectorstore = FAISS.from_documents(
-                documents=documents,
-                embedding=progress_embeddings
-            )
+            try:
+                self.vectorstore = FAISS.from_documents(
+                    documents=documents,
+                    embedding=self.embeddings
+                )
+                
+                embed_duration = time.time() - embed_start
+                logger.info(f"✓ Embeddings generated in {embed_duration:.1f}s ({embed_duration/len(documents):.2f}s per abstract)")
+                
+            except Exception as e:
+                logger.error(f"Failed to generate embeddings: {e}")
+                raise
             
             self._paper_count = len(documents)
             
@@ -225,21 +234,16 @@ class Layer1VectorStore:
             
             # 如果有閾值，進行過濾（不限制數量）
             if score_threshold is not None:
-                # FAISS 返回的是 L2 距離的平方
-                # 對於正規化的向量: cosine_similarity ≈ 1 - (L2_distance² / 2)
-                # 但更簡單的方式：較小的距離 = 較高的相似度
-                # 我們使用: similarity = 1 / (1 + sqrt(distance))
+                # FAISS 返回的是距離分數（L2距離），需要轉換為相似度
+                # 相似度 = 1 / (1 + distance)
                 filtered_results = []
-                for idx, (doc, distance) in enumerate(results):
+                for doc, distance in results:
                     # 轉換為相似度分數 (0-1)
-                    # 使用平方根來減緩距離的增長
-                    import math
-                    similarity = 1 / (1 + math.sqrt(distance))
+                    similarity = 1 / (1 + distance)
                     
                     # 調試：顯示前幾個論文的分數
-                    if idx < 5:  # 顯示前 5 個
-                        logger.info(f"  Paper {idx+1}: {doc.metadata.get('title', 'Unknown')[:50]}")
-                        logger.info(f"    Distance={distance:.4f}, Similarity={similarity:.4f}, Threshold={score_threshold:.2f}, Pass={similarity >= score_threshold}")
+                    if len(filtered_results) < 3:
+                        logger.debug(f"  Paper: {doc.metadata.get('title', 'Unknown')[:40]}, distance={distance:.3f}, similarity={similarity:.3f}, threshold={score_threshold:.3f}")
                     
                     # 只保留超過閾值的結果
                     if similarity >= score_threshold:
@@ -253,10 +257,9 @@ class Layer1VectorStore:
                 return filtered_results
             else:
                 # 沒有閾值，返回 top-k（轉換分數）
-                import math
                 converted_results = []
                 for doc, distance in results[:k]:
-                    similarity = 1 / (1 + math.sqrt(distance))
+                    similarity = 1 / (1 + distance)
                     converted_results.append((doc, similarity))
                 
                 logger.debug(f"Layer 1 found {len(converted_results)} papers with scores")
