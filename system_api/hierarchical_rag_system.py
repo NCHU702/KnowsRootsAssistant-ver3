@@ -525,27 +525,49 @@ class HierarchicalRAGSystem:
             similarity_threshold = self.config['layer1'].get('similarity_threshold')
             
             # 判斷使用混合檢索還是純語義搜尋
+            # 先獲取所有結果（不使用 threshold 過濾），用於顯示
             if self.hybrid_retriever and self.config.get('hybrid_search', {}).get('enabled', False):
                 # 使用混合檢索 (語義 + 關鍵詞) with adjusted weights
                 logger.info("使用混合檢索 (Hybrid Search: 語義 + 關鍵詞)")
                 logger.info(f"  當前權重: 語義={semantic_weight:.2f}, 關鍵詞={keyword_weight:.2f}")
                 
-                layer1_results_with_scores = self.hybrid_retriever.hybrid_search(
+                # 先不使用 threshold，獲取所有結果
+                layer1_all_results = self.hybrid_retriever.hybrid_search(
                     query=query,
                     k=k1,
                     semantic_weight=semantic_weight,
                     keyword_weight=keyword_weight,
-                    score_threshold=similarity_threshold,
+                    score_threshold=None,  # 不過濾，顯示所有結果
                     return_scores_breakdown=False
                 )
+                
+                # 再應用 threshold 過濾（用於後續處理）
+                if similarity_threshold is not None:
+                    layer1_results_with_scores = [
+                        (doc, score) for doc, score in layer1_all_results 
+                        if score >= similarity_threshold
+                    ]
+                else:
+                    layer1_results_with_scores = layer1_all_results
             else:
                 # 使用純語義搜尋
                 logger.info("使用純語義搜尋 (Semantic Search)")
-                layer1_results_with_scores = self.layer1.search_with_scores(
+                
+                # 先不使用 threshold
+                layer1_all_results = self.layer1.search_with_scores(
                     query=query, 
                     k=k1,
-                    score_threshold=similarity_threshold
+                    score_threshold=None
                 )
+                
+                # 再應用 threshold 過濾
+                if similarity_threshold is not None:
+                    layer1_results_with_scores = [
+                        (doc, score) for doc, score in layer1_all_results 
+                        if score >= similarity_threshold
+                    ]
+                else:
+                    layer1_results_with_scores = layer1_all_results
             
             # 提取文檔（用於後續處理）
             layer1_docs = [doc for doc, score in layer1_results_with_scores]
@@ -555,10 +577,26 @@ class HierarchicalRAGSystem:
             result['layer1_docs'] = layer1_docs  # Save Layer 1 docs for reference display
             result['layer1_scores'] = [score for doc, score in layer1_results_with_scores]  # Save scores for display
             
-            logger.info(f"Retrieved {len(layer1_docs)} papers"
+            # 總是顯示前 5 名相似度最高的論文（從所有結果中）
+            logger.info("\n📊 Layer 1 前 5 名相似度最高的論文:")
+            logger.info("─" * 80)
+            if layer1_all_results:
+                for i, (doc, score) in enumerate(layer1_all_results[:5], 1):
+                    title = doc.metadata.get('title', 'Unknown')
+                    # 標記是否通過 threshold
+                    passed = "✓" if similarity_threshold is None or score >= similarity_threshold else "✗"
+                    logger.info(f"  {i}. [{score:.4f}] {passed} {title}")
+                
+                if similarity_threshold is not None:
+                    passed_count = len(layer1_results_with_scores)
+                    total_count = len(layer1_all_results)
+                    logger.info(f"\n  通過閾值 ({similarity_threshold:.2f}): {passed_count}/{total_count} 篇")
+            else:
+                logger.warning("  ⚠️  沒有找到任何論文")
+            logger.info("─" * 80)
+            
+            logger.info(f"\nRetrieved {len(layer1_docs)} papers"
                        f"{f' (threshold: {similarity_threshold:.2f})' if similarity_threshold else ''}")
-            for i, (doc, score) in enumerate(layer1_results_with_scores[:5], 1):
-                logger.info(f"  {i}. {doc.metadata.get('title', 'Unknown')[:60]} (similarity: {score:.3f})")
             
             if not layer1_docs:
                 logger.warning("No relevant papers found in Layer 1")
@@ -612,18 +650,31 @@ class HierarchicalRAGSystem:
             logger.info(f"Filtering by {len(paper_ids)} papers from Layer 1")
             
             k2 = self.config['layer2']['k_documents']
-            layer2_docs = self.layer2.search(
+            layer2_results_with_scores = self.layer2.search_with_scores(
                 query=query,
                 k=k2,
                 filter_paper_ids=paper_ids
             )
             
+            # 提取文檔
+            layer2_docs = [doc for doc, score in layer2_results_with_scores]
+            
             result['timings']['layer2_retrieval'] = time.time() - layer2_start
             result['layers_used'].append('layer2')
             
             logger.info(f"Retrieved {len(layer2_docs)} chunks")
-            for i, doc in enumerate(layer2_docs[:3], 1):
-                logger.info(f"  {i}. {doc.metadata.get('chunk_id', 'Unknown')[:60]}")
+            
+            # 顯示前 5 名相似度最高的文檔片段
+            if layer2_results_with_scores:
+                logger.info("\n📊 前 5 名相似度最高的文檔片段:")
+                logger.info("─" * 80)
+                for i, (doc, score) in enumerate(layer2_results_with_scores[:5], 1):
+                    chunk_id = doc.metadata.get('chunk_id', 'Unknown')
+                    paper_title = doc.metadata.get('title', 'Unknown')
+                    content_preview = doc.page_content[:60].replace('\n', ' ')
+                    logger.info(f"  {i}. [{score:.4f}] {paper_title}")
+                    logger.info(f"      Chunk: {chunk_id} | Preview: {content_preview}...")
+                logger.info("─" * 80)
             
             if not layer2_docs:
                 logger.warning("No chunks found in Layer 2, using Layer 1 results")

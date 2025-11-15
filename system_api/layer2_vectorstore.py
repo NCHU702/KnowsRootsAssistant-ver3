@@ -277,6 +277,51 @@ class Layer2VectorStore:
             logger.error(f"Layer 2 search failed: {e}", exc_info=True)
             return []
     
+    def search_with_scores(
+        self,
+        query: str,
+        k: int = 10,
+        filter_paper_ids: Optional[List[str]] = None,
+        **kwargs
+    ) -> List[tuple[Document, float]]:
+        """
+        Search for relevant chunks and return with similarity scores
+        
+        Args:
+            query: User query string
+            k: Number of chunks to retrieve
+            filter_paper_ids: Optional list of paper IDs to filter by
+            **kwargs: Additional search parameters
+            
+        Returns:
+            List of (Document, score) tuples
+        """
+        if not self.vectorstore:
+            logger.error("VectorStore not initialized. Call build_index() or load() first.")
+            return []
+        
+        try:
+            # If filtering by papers, use dynamic subindex
+            if filter_paper_ids:
+                return self._search_filtered_with_scores(query, k, filter_paper_ids, **kwargs)
+            
+            # Otherwise, search full index
+            logger.debug(f"Layer 2 search with scores (full): query='{query[:50]}...', k={k}")
+            
+            results = self.vectorstore.similarity_search_with_score(
+                query=query,
+                k=k,
+                **kwargs
+            )
+            
+            logger.debug(f"Layer 2 found {len(results)} chunks with scores")
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Layer 2 search with scores failed: {e}", exc_info=True)
+            return []
+    
     def _search_filtered(
         self,
         query: str,
@@ -312,6 +357,46 @@ class Layer2VectorStore:
         if filtered_vs:
             results = filtered_vs.similarity_search(query, k=k, **kwargs)
             logger.debug(f"Layer 2 filtered search found {len(results)} chunks")
+            return results
+        else:
+            logger.warning("Failed to create filtered vectorstore, returning empty results")
+            return []
+    
+    def _search_filtered_with_scores(
+        self,
+        query: str,
+        k: int,
+        paper_ids: List[str],
+        **kwargs
+    ) -> List[tuple[Document, float]]:
+        """
+        Search with paper ID filtering and return scores
+        
+        Args:
+            query: User query
+            k: Number of results
+            paper_ids: List of paper IDs to search within
+            **kwargs: Additional search parameters
+            
+        Returns:
+            List of (Document, score) tuples
+        """
+        logger.debug(f"Layer 2 filtered search with scores: {len(paper_ids)} papers, k={k}")
+        
+        # Try to get from cache
+        cache_key = tuple(sorted(paper_ids))
+        filtered_vs = self._subindex_cache.get(cache_key)
+        
+        # If not cached, create subindex
+        if filtered_vs is None:
+            filtered_vs = self.create_filtered_vectorstore(paper_ids)
+            if filtered_vs:
+                self._subindex_cache.put(cache_key, filtered_vs)
+        
+        # Search in filtered vectorstore with scores
+        if filtered_vs:
+            results = filtered_vs.similarity_search_with_score(query, k=k, **kwargs)
+            logger.debug(f"Layer 2 filtered search found {len(results)} chunks with scores")
             return results
         else:
             logger.warning("Failed to create filtered vectorstore, returning empty results")
