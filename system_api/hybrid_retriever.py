@@ -76,8 +76,66 @@ class HybridRetriever:
             logger.warning("use_llm_analyzer=True 但未提供 LLM，將使用字典式智能權重")
             self.use_llm_analyzer = False
         
+        # 初始化 jieba 自定義詞典（載入醫療詞彙）
+        if self.use_jieba:
+            self._initialize_jieba_dictionary()
+        
         if build_index_on_init and self.layer1.is_initialized:
             self.build_bm25_index()
+    
+    def _initialize_jieba_dictionary(self):
+        """
+        初始化 jieba 自定義詞典
+        載入醫療詞彙、技術詞彙等
+        """
+        try:
+            # 載入醫療詞典
+            from .medical_dictionary import get_jieba_custom_words
+            
+            medical_words = get_jieba_custom_words()
+            medical_count = 0
+            for word, freq, tag in medical_words:
+                jieba.add_word(word, freq=freq, tag=tag)
+                medical_count += 1
+            
+            logger.info(f"✓ jieba 醫療詞典載入完成：{medical_count} 個詞彙")
+            
+        except ImportError as e:
+            logger.warning(f"無法載入醫療詞典: {e}")
+        
+        # 載入技術/領域詞彙
+        tech_terms = [
+            # 深度學習相關
+            ('深度學習', 8000, 'tech'), ('機器學習', 8000, 'tech'),
+            ('人工智慧', 7000, 'tech'), ('神經網路', 7000, 'tech'),
+            ('卷積神經網路', 6000, 'tech'), ('循環神經網路', 6000, 'tech'),
+            ('CNN', 6000, 'tech'), ('RNN', 6000, 'tech'),
+            ('LSTM', 6000, 'tech'), ('GRU', 5000, 'tech'),
+            ('Transformer', 6000, 'tech'), ('BERT', 5000, 'tech'),
+            
+            # 電腦視覺
+            ('電腦視覺', 6000, 'tech'), ('影像辨識', 6000, 'tech'),
+            ('影像分類', 5000, 'tech'), ('物件偵測', 5000, 'tech'),
+            ('語義分割', 5000, 'tech'), ('圖像處理', 5000, 'tech'),
+            
+            # 自然語言處理
+            ('自然語言處理', 6000, 'tech'), ('NLP', 6000, 'tech'),
+            ('文本分類', 5000, 'tech'), ('情感分析', 5000, 'tech'),
+            ('命名實體識別', 5000, 'tech'), ('機器翻譯', 5000, 'tech'),
+            
+            # 應用領域
+            ('人流預測', 7000, 'domain'), ('人流分析', 7000, 'domain'),
+            ('交通預測', 6000, 'domain'), ('交通流量', 6000, 'domain'),
+            ('醫療影像', 7000, 'domain'), ('疾病診斷', 7000, 'domain'),
+            ('異常檢測', 6000, 'domain'), ('故障診斷', 6000, 'domain'),
+        ]
+        
+        tech_count = 0
+        for word, freq, tag in tech_terms:
+            jieba.add_word(word, freq=freq, tag=tag)
+            tech_count += 1
+        
+        logger.info(f"✓ jieba 技術詞典載入完成：{tech_count} 個詞彙")
     
     def _tokenize(self, text: str) -> List[str]:
         """
@@ -338,7 +396,7 @@ class HybridRetriever:
                 keyword_weight * key_score
             )
             
-            # 智能系統：核心詞匹配獎勵
+            # 智能系統：核心詞匹配獎勵（優化版）
             if self.smart_weighting:
                 doc = self.layer1.get_paper_by_id(paper_id)
                 if doc:
@@ -352,13 +410,15 @@ class HybridRetriever:
                         doc_tokens=doc_tokens
                     )
                     
-                    # 如果核心詞匹配好，給予獎勵（最多 +0.2）
-                    if match_score > 0.5:
-                        bonus = 0.2 * match_score
+                    # 優化：只有在語義分數也高的情況下才給獎勵
+                    # 避免給不相關但恰好匹配某些詞的文檔高分
+                    if match_score > 0.5 and sem_score >= 0.45:
+                        # 獎勵與語義分數成正比，避免提升低相關度文檔
+                        bonus = 0.15 * match_score * (sem_score / 0.5)  # 最多 +0.15
                         combined_score += bonus
                         logger.debug(
                             f"核心詞匹配獎勵: {doc.metadata.get('title', '')[:40]} "
-                            f"+{bonus:.3f} (匹配率={match_score:.2f})"
+                            f"+{bonus:.3f} (匹配率={match_score:.2f}, 語義={sem_score:.3f})"
                         )
             
             # 應用閾值過濾

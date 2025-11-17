@@ -114,6 +114,48 @@ class LLMTermAnalyzer:
   "reasoning": "「CNN」是特定模型，「圖像」是具體領域，這兩個是核心；「分類」是常見任務詞彙"
 }}
 
+⭐ **特別注意：醫療領域查詢規則**
+
+醫療領域查詢特別重要，請遵循以下規則：
+
+1. **疾病名稱必須歸類為核心詞彙（CORE）**
+   - 包括但不限於：鼻咽癌、肺癌、糖尿病、高血壓、中風、肝炎、腎衰竭等
+   - 疾病是查詢的核心主題，決定了搜尋範圍
+
+2. **醫療檢查/治療必須歸類為核心詞彙（CORE）**
+   - 包括：CT、MRI、X光、超音波、化療、放療、標靶治療等
+   - 這些是具體的醫療技術，不是廣泛詞彙
+
+3. **醫療專有名詞必須歸類為核心詞彙（CORE）**
+   - 解剖學：器官、血管、神經、骨骼等
+   - 病理學：腫瘤、轉移、發炎、感染等
+
+範例（醫療領域）:
+查詢: "深度學習在鼻咽癌的應用"
+分詞: 深度, 學習, 鼻咽癌, 應用
+回答:
+{{
+  "core_terms": ["鼻咽癌"],
+  "generic_terms": ["深度", "學習", "應用"],
+  "auxiliary_terms": ["在", "的"],
+  "domain": "醫療-癌症研究",
+  "intent": "尋找深度學習在鼻咽癌診斷/治療/預測的應用案例",
+  "reasoning": "「鼻咽癌」是特定疾病名稱，是查詢的核心關鍵詞，必須精準匹配；「深度學習」和「應用」是常見技術詞彙"
+}}
+
+範例（醫療領域）:
+查詢: "CT影像分析"
+分詞: CT, 影像, 分析
+回答:
+{{
+  "core_terms": ["CT", "影像"],
+  "generic_terms": ["分析"],
+  "auxiliary_terms": [],
+  "domain": "醫療影像",
+  "intent": "尋找CT影像分析相關研究",
+  "reasoning": "「CT」是特定醫療檢查技術，「影像」是具體研究對象，都是核心詞；「分析」是常見研究方法"
+}}
+
 現在請分析以下查詢:
 查詢: {query}
 分詞: {tokens_str}
@@ -253,7 +295,7 @@ class LLMTermAnalyzer:
         """
         當 LLM 分析失敗時的後備方案
         
-        使用簡單規則進行分類
+        使用簡單規則進行分類，優先識別醫療詞彙
         
         Args:
             query_tokens: 分詞列表
@@ -261,42 +303,102 @@ class LLMTermAnalyzer:
         Returns:
             基本分析結果
         """
-        logger.warning("使用 Fallback 分析")
+        logger.warning("使用 Fallback 分析（含醫療詞典）")
         
-        # 預定義的廣泛詞列表
+        # 導入醫療詞典
+        try:
+            from .medical_dictionary import (
+                is_disease_name, 
+                is_critical_medical_term,
+                is_medical_term,
+                get_medical_category
+            )
+            medical_dict_available = True
+        except ImportError:
+            logger.warning("醫療詞典不可用，使用標準 fallback")
+            medical_dict_available = False
+        
+        # 預定義的廣泛詞列表（學術常用詞）
         common_generic_terms = {
             '深度', '學習', '機器', '應用', '方法', '模型', '系統',
             '研究', '分析', '預測', '使用', '基於', '利用', '探討',
-            '提出', '設計', '實現', '建構', '開發', '優化', '改進'
+            '提出', '設計', '實現', '建構', '開發', '優化', '改進',
+            '評估', '比較', '辨識', '檢測', '診斷', '分類', '識別',
+            '技術', '演算法', '網路', '神經', '卷積', '循環'
         }
         
         # 預定義的輔助詞
         auxiliary_words = {
             '什麼', '如何', '為什麼', '是', '的', '在', '與', '和',
-            '或', '等', '及', '以', '於', '中', '嗎', '呢'
+            '或', '等', '及', '以', '於', '中', '嗎', '呢', '了', '著',
+            '過', '之', '其', '該', '此', '這', '那'
         }
         
         core_terms = []
         generic_terms = []
         auxiliary_terms = []
+        detected_domain = 'Unknown'
+        medical_terms_found = []
         
         for token in query_tokens:
+            # 跳過單字元（除非是重要的）
+            if len(token) <= 1 and token not in ['X', 'Y', 'Z']:
+                auxiliary_terms.append(token)
+                continue
+            
+            # 優先級 1: 輔助詞
             if token in auxiliary_words:
                 auxiliary_terms.append(token)
+            
+            # 優先級 2: 醫療專有名詞（最高優先級的核心詞）
+            elif medical_dict_available and is_disease_name(token):
+                # 疾病名稱 → 絕對核心詞
+                core_terms.append(token)
+                medical_terms_found.append(f"{token}(疾病)")
+                detected_domain = '醫療'
+            
+            elif medical_dict_available and is_critical_medical_term(token):
+                # 關鍵醫療詞彙（疾病 + 重要檢查/治療）→ 核心詞
+                core_terms.append(token)
+                category = get_medical_category(token)
+                medical_terms_found.append(f"{token}({category})")
+                if detected_domain == 'Unknown':
+                    detected_domain = '醫療'
+            
+            elif medical_dict_available and is_medical_term(token):
+                # 一般醫療術語 → 核心詞（醫療領域所有詞都重要）
+                core_terms.append(token)
+                category = get_medical_category(token)
+                medical_terms_found.append(f"{token}({category})")
+                if detected_domain == 'Unknown':
+                    detected_domain = '醫療'
+            
+            # 優先級 3: 廣泛學術詞彙
             elif token in common_generic_terms:
                 generic_terms.append(token)
+            
+            # 優先級 4: 其他詞彙 → 預設為核心詞（保守策略）
             else:
-                # 預設為核心詞
                 core_terms.append(token)
+        
+        # 確保至少有一個核心詞
+        if not core_terms and generic_terms:
+            core_terms.append(generic_terms.pop(0))
+        
+        # 生成推理說明
+        reasoning_parts = ['Fallback 規則式分析（LLM 不可用）']
+        if medical_terms_found:
+            reasoning_parts.append(f"識別到醫療詞彙: {', '.join(medical_terms_found[:3])}")
         
         return {
             'core_terms': core_terms,
             'generic_terms': generic_terms,
             'auxiliary_terms': auxiliary_terms,
-            'domain': 'Unknown',
-            'intent': 'Unknown',
-            'reasoning': 'Fallback analysis - LLM 不可用',
-            'is_fallback': True
+            'domain': detected_domain,
+            'intent': '一般查詢',
+            'reasoning': '; '.join(reasoning_parts),
+            'is_fallback': True,
+            'medical_terms_detected': len(medical_terms_found) > 0
         }
     
     def compute_smart_weights(

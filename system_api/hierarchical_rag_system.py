@@ -26,6 +26,7 @@ from system_api.progress_embeddings import ProgressEmbeddings
 from system_api.hybrid_retriever import HybridRetriever
 from system_api.query_expander import QueryExpander
 from system_api.adaptive_weights import AdaptiveWeightAdjuster
+from system_api.layer2_trigger import Layer2TriggerDecision
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,10 @@ class HierarchicalRAGSystem:
         
         self.confidence_evaluator = ConfidenceEvaluator(self.evaluation_llm)
         self.context_expander = ContextExpander(self.layer2)
+        
+        # Layer 2 觸發決策器
+        self.layer2_trigger = Layer2TriggerDecision(llm=self.llm)
+        logger.info("✓ Layer 2 Trigger Decision initialized")
         
         # Query expansion and adaptive weights
         self.query_expander: Optional[QueryExpander] = None
@@ -624,14 +629,40 @@ class HierarchicalRAGSystem:
             logger.info(f"  Should continue: {evaluation1['should_continue']}")
             logger.info(f"  Reasoning: {evaluation1['reasoning'][:100]}...")
             
-            # Early termination check
-            if not evaluation1['should_continue']:
-                logger.info("✓ Early termination: Layer 1 results sufficient")
+            # ========== 使用智能觸發決策器 ==========
+            logger.info("\n" + "="*60)
+            logger.info("Layer 2 觸發決策分析")
+            logger.info("="*60)
+            
+            trigger_decision = self.layer2_trigger.should_trigger_layer2(
+                query=query,
+                layer1_evaluation=evaluation1,
+                layer1_docs=layer1_docs,
+                base_threshold=threshold1
+            )
+            
+            logger.info(f"決策結果:")
+            logger.info(f"  是否觸發 Layer 2: {trigger_decision['should_trigger']}")
+            logger.info(f"  查詢類型: {trigger_decision['decision_factors']['query_type']}")
+            logger.info(f"  查詢複雜度: {trigger_decision['decision_factors']['query_complexity']}")
+            logger.info(f"  基礎閾值: {trigger_decision['decision_factors']['base_threshold']:.2f}")
+            logger.info(f"  調整後閾值: {trigger_decision['adjusted_threshold']:.2f}")
+            logger.info(f"  決策理由: {trigger_decision['reason']}")
+            
+            # 記錄決策資訊
+            result['layer2_trigger_decision'] = trigger_decision
+            
+            # 根據智能決策判斷是否進入 Layer 2
+            if not trigger_decision['should_trigger']:
+                logger.info("✓ 智能決策: Layer 1 結果已足夠，無需進入 Layer 2")
                 result['final_docs'] = layer1_docs
                 result['final_confidence'] = evaluation1['confidence']
                 result['terminated_at'] = 'layer1'
+                result['termination_reason'] = trigger_decision['reason']
                 result['timings']['total'] = time.time() - start_time
                 return result
+            
+            logger.info("→ 智能決策: 需要進入 Layer 2 獲取更詳細資訊")
             
             # ============================================================
             # LAYER 2: Chunk-level retrieval
