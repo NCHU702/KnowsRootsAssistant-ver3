@@ -35,7 +35,8 @@ class Layer2VectorStore:
         chunk_overlap: int = 100,
         cache_size: int = 10,
         use_reranker: bool = True,  # 保留參數以兼容舊代碼，但強制 True
-        reranker_config: Optional[Dict[str, Any]] = None
+        reranker_config: Optional[Dict[str, Any]] = None,
+        chunking_config: Optional[Dict[str, Any]] = None  # NEW: Summarization support
     ):
         """
         初始化 Layer 2 VectorStore (Re-ranking only)
@@ -48,12 +49,17 @@ class Layer2VectorStore:
             cache_size: 快取大小（保留以兼容）
             use_reranker: 是否使用 re-ranker（強制 True）
             reranker_config: Re-ranker 配置
+            chunking_config: Chunking configuration (NEW: supports 'naive' or 'summarization' mode)
         """
         self.embeddings = embeddings  # 保留以兼容
         self.vectorstore_path = vectorstore_path
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.use_reranker = True  # 強制啟用
+        
+        # Parse chunking config
+        self.chunking_config = chunking_config or {}
+        self.chunking_mode = self.chunking_config.get('mode', 'naive')  # Default: naive (backward compatible)
         
         # 文件路徑
         self.jsonl_file = os.path.join(vectorstore_path, "chunks.jsonl")
@@ -76,11 +82,17 @@ class Layer2VectorStore:
         self._document_store = None
         self._reranker_config = reranker_config or {}
         
+        # Summarization components (if enabled)
+        self.section_parser = None
+        self.summarizer = None
+        if self.chunking_mode == 'summarization':
+            self._init_summarization_components()
+        
         # 初始化
         os.makedirs(vectorstore_path, exist_ok=True)
         self._init_reranking_components()
         
-        logger.info("✓ Layer 2 VectorStore initialized (Re-ranking only mode)")
+        logger.info(f"✓ Layer 2 VectorStore initialized (chunking_mode={self.chunking_mode})")
     
     def _init_reranking_components(self):
         """初始化 Cross-Encoder re-ranker 和 document store"""
@@ -120,6 +132,38 @@ class Layer2VectorStore:
             logger.error(f"Failed to initialize re-ranking components: {e}", exc_info=True)
             raise RuntimeError("Cannot initialize Layer 2 without re-ranking components")
     
+    def _init_summarization_components(self):
+        """Initialize PDF section parser and LLM summarizer"""
+        try:
+            from system_api.pdf_section_parser import PDFSectionParser
+            from system_api.llm_summarizer import LLMSummarizer
+            
+            # Section parser
+            parser_method = self.chunking_config.get('section_parser', 'pymupdf_regex')
+            min_sections = self.chunking_config.get('min_sections', 3)
+            self.section_parser = PDFSectionParser(method=parser_method, min_sections=min_sections)
+            
+            # LLM summarizer
+            summarizer_model = self.chunking_config.get('model', 'jcai/llama-3-taiwan-8b-instruct:q4_k_m')
+            ollama_base_url = self.chunking_config.get('ollama_base_url', 'http://localhost:11434')
+            map_reduce_threshold = self.chunking_config.get('map_reduce_threshold', 1500)
+            target_summary_length = self.chunking_config.get('target_summary_length', 300)
+            
+            self.summarizer = LLMSummarizer(
+                model_name=summarizer_model,
+                ollama_base_url=ollama_base_url,
+                map_reduce_threshold=map_reduce_threshold,
+                target_summary_length=target_summary_length
+            )
+            
+            logger.info("✓ Summarization components initialized")
+            logger.info(f"  Parser: {parser_method}, Summarizer: {summarizer_model}")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize summarization components: {e}", exc_info=True)
+            logger.warning("Falling back to naive chunking mode")
+            self.chunking_mode = 'naive'
+    
     def _update_statistics(self):
         """更新 chunk 和 paper 統計"""
         try:
@@ -143,8 +187,25 @@ class Layer2VectorStore:
         """
         建構索引（存儲所有 chunks 到 JSONL）
         
+        Dispatches to either naive or summarization mode based on config.
+        
         Args:
             documents: 文檔列表（每個 document 是一個 chunk）
+            
+        Returns:
+            True if successful
+        """
+        if self.chunking_mode == 'summarization':
+            return self._build_index_with_summarization(documents)
+        else:
+            return self._build_index_naive(documents)
+    
+    def _build_index_naive(self, documents: List[Document]) -> bool:
+        """
+        Build index using naive chunking (original behavior)
+        
+        Args:
+            documents: Document list (each is a chunk)
             
         Returns:
             True if successful
@@ -154,7 +215,7 @@ class Layer2VectorStore:
                 logger.warning("No documents provided to build index")
                 return False
             
-            logger.info(f"Building Layer 2 index with {len(documents)} chunks...")
+            logger.info(f"Building Layer 2 index (naive mode) with {len(documents)} chunks...")
             start_time = time.time()
             
             # 驗證
@@ -186,7 +247,180 @@ class Layer2VectorStore:
                 return False
                 
         except Exception as e:
-            logger.error(f"Failed to build index: {e}", exc_info=True)
+            logger.error(f"Failed to build index (naive): {e}", exc_info=True)
+            return False
+    
+    def _build_index_with_summarization(self, documents: List[Document]) -> bool:
+        """
+        Build index using summarization strategy
+        
+        Strategy:
+        1. Group documents by paper_id
+        2. For each paper:
+           - Get PDF path from metadata
+           - Parse sections (PDFSectionParser)
+           - Summarize sections (LLMSummarizer)
+           - Create Document objects with enhanced metadata
+        3. Store in JSONL
+        
+        Args:
+            documents: Document list (can be raw or pre-chunked)
+            
+        Returns:
+            True if successful
+        """
+        try:
+            if not documents:
+                logger.warning("No documents provided to build index")
+                return False
+            
+            logger.info(f"Building Layer 2 index (summarization mode) with {len(documents)} docs...")
+            start_time = time.time()
+            
+            # Group by paper_id
+            papers = {}
+            for doc in documents:
+                paper_id = doc.metadata.get('paper_id')
+                if not paper_id:
+                    logger.warning("Skipping document - missing paper_id")
+                    continue
+                if paper_id not in papers:
+                    papers[paper_id] = []
+                papers[paper_id].append(doc)
+            
+            logger.info(f"Processing {len(papers)} papers for summarization")
+            
+            # Process each paper
+            summarized_chunks = []
+            for paper_idx, (paper_id, paper_docs) in enumerate(papers.items(), 1):
+                logger.info(f"[{paper_idx}/{len(papers)}] Processing paper {paper_id}")
+                
+                # Get PDF path
+                pdf_path = paper_docs[0].metadata.get('pdf_path')
+                if not pdf_path or not os.path.exists(pdf_path):
+                    logger.warning(f"PDF not found for {paper_id}, falling back to naive chunking")
+                    # Fallback: Use naive chunks for this paper
+                    for doc in paper_docs:
+                        if len(doc.page_content) >= 50:
+                            doc.metadata['chunk_type'] = 'naive_chunk'
+                            summarized_chunks.append(doc)
+                    continue
+                
+                try:
+                    # Parse sections
+                    sections = self.section_parser.parse(pdf_path)
+                    logger.info(f"  Extracted {len(sections)} sections")
+                    
+                    # Get paper context
+                    paper_title = paper_docs[0].metadata.get('title', '')
+                    
+                    # Define sections to skip (matching Layer 1's text_preprocessor.py logic)
+                    # These are the same sections that Layer 1 removes via text preprocessing
+                    # Based on analysis of 45 PDFs (475 skip section headers found)
+                    skip_section_keywords = [
+                        # References (参考文献) - 315 occurrences
+                        'bibliography', 'reference', 'references',
+                        '参考文献', '參考文獻', '引用文獻', '文獻',
+                        '文獻回顧', '文獻探討',  # Common in Chinese theses (17x + 9x)
+                        
+                        # Appendix (附录) - 3 occurrences
+                        'appendix', 'appendices', '附录', '附錄',
+                        
+                        # Acknowledgements (致谢) - 32 occurrences
+                        'acknowledgement', 'acknowledgements', 'acknowledgment',
+                        '致謝', '誌謝', '謝誌', '謝辭',
+                        
+                        # Table of Contents (目录) - 111 occurrences
+                        'contents', 'table of contents', '目录', '目錄',
+                        '圖片目錄', '表格目錄',  # 1x each
+                        
+                        # List of Tables/Figures (表/图目录) - 34 occurrences each
+                        'list of tables', '表目录', '表目錄',
+                        'list of figures', '图目录', '圖目錄'
+                    ]
+                    
+                    # Summarize each section
+                    for section_idx, section in enumerate(sections, 1):
+                        # Skip low-value sections (same as Layer 1 preprocessing)
+                        section_name_lower = section.name.lower()
+                        if any(keyword.lower() in section_name_lower for keyword in skip_section_keywords):
+                            logger.info(f"  [{section_idx}/{len(sections)}] Skipping {section.name} (filtered by Layer 1 logic)")
+                            continue
+                        
+                        logger.info(f"  [{section_idx}/{len(sections)}] Summarizing {section.name}...")
+                        
+                        try:
+                            summary = self.summarizer.summarize_section(
+                                section.text,
+                                section.name,
+                                paper_context=paper_title
+                            )
+                            
+                            # Create Document with enhanced metadata
+                            chunk_doc = Document(
+                                page_content=summary,
+                                metadata={
+                                    'paper_id': paper_id,
+                                    'chunk_id': f"{paper_id}_{section.name.lower().replace(' ', '_')}",
+                                    'chunk_type': 'section_summary',
+                                    'section_name': section.name,
+                                    'original_length': section.char_count,
+                                    'summary_length': len(summary),
+                                    'start_page': section.start_page,
+                                    'end_page': section.end_page,
+                                    **{k: v for k, v in paper_docs[0].metadata.items() 
+                                       if k not in ['chunk_id', 'chunk_type', 'section_name']}  # Inherit paper metadata
+                                }
+                            )
+                            summarized_chunks.append(chunk_doc)
+                            logger.info(f"  ✓ Summary: {len(section.text)} → {len(summary)} chars")
+                            
+                        except Exception as e:
+                            logger.error(f"  Failed to summarize {section.name}: {e}")
+                            # Fallback: Use extractive summary
+                            extractive = section.text[:300] + "..." if len(section.text) > 300 else section.text
+                            chunk_doc = Document(
+                                page_content=extractive,
+                                metadata={
+                                    'paper_id': paper_id,
+                                    'chunk_id': f"{paper_id}_{section.name.lower().replace(' ', '_')}",
+                                    'chunk_type': 'extractive_summary',
+                                    'section_name': section.name,
+                                    'original_length': section.char_count,
+                                    **paper_docs[0].metadata
+                                }
+                            )
+                            summarized_chunks.append(chunk_doc)
+                
+                except Exception as e:
+                    logger.error(f"Failed to process paper {paper_id}: {e}")
+                    # Fallback: Use naive chunks
+                    for doc in paper_docs:
+                        if len(doc.page_content) >= 50:
+                            doc.metadata['chunk_type'] = 'naive_chunk'
+                            summarized_chunks.append(doc)
+            
+            if not summarized_chunks:
+                logger.error("No summarized chunks generated")
+                return False
+            
+            # Store in JSONL
+            logger.info(f"Storing {len(summarized_chunks)} summarized chunks...")
+            success = self._document_store.store_chunks(summarized_chunks)
+            
+            if success:
+                self._update_statistics()
+                elapsed = time.time() - start_time
+                logger.info(f"✓ Index built in {elapsed:.2f}s")
+                logger.info(f"  Chunks: {self._chunk_count}, Papers: {self._paper_count}")
+                logger.info(f"  Average: {elapsed/len(papers):.1f}s per paper")
+                return True
+            else:
+                logger.error("Failed to store chunks")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Failed to build index (summarization): {e}", exc_info=True)
             return False
     
     def add_chunks(self, chunks: List[Document]) -> bool:

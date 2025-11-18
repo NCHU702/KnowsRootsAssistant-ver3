@@ -139,23 +139,8 @@ class Layer2TriggerDecision:
                 'decision_factors': factors
             }
         
-        # ===== 優先級 5：Layer 1 結果太少 → 謹慎判斷 =====
-        # 情況 E：結果很少（1-2 篇）→ 根據查詢類型決定
-        if len(layer1_docs) <= 2:
-            # 如果是一般查詢且信心度還可以，進 Layer 2 補充資訊
-            if query_analysis['type'] == 'general' and confidence >= 0.4:
-                return {
-                    'should_trigger': True,
-                    'reason': (
-                        f"Layer 1 僅找到 {len(layer1_docs)} 篇論文（較少），"
-                        f"進入 Layer 2 以獲取更完整資訊"
-                    ),
-                    'adjusted_threshold': adjusted_threshold,
-                    'decision_factors': factors
-                }
-        
-        # ===== 優先級 6：信心評估明確指出需要細節 =====
-        # 情況 F：LLM 評估認為需要更多資訊
+        # ===== 優先級 5：信心評估明確指出需要細節 =====
+        # 情況 E：LLM 評估認為需要更多資訊
         need_details_keywords = [
             '缺少', '不足', '需要更多', '細節', '具體',
             '不夠', '需補充', '資訊有限', '不完整', '太簡略'
@@ -168,8 +153,8 @@ class Layer2TriggerDecision:
                 'decision_factors': factors
             }
         
-        # ===== 優先級 7：Layer 1 結果充足 → 可能不需要 Layer 2 =====
-        # 情況 G：結果很多（>= 5 篇）→ 優先使用 Layer 1
+        # ===== 優先級 6：Layer 1 結果充足 → 可能不需要 Layer 2 =====
+        # 情況 F：結果很多（>= 5 篇）→ 優先使用 Layer 1
         if len(layer1_docs) >= 5:
             # 對於一般查詢或綜觀性查詢，結果多就不需要 Layer 2
             if query_analysis['type'] in ['general', 'overview', 'list', 'comparison', 'application']:
@@ -184,8 +169,8 @@ class Layer2TriggerDecision:
                         'decision_factors': factors
                     }
         
-        # ===== 優先級 8：查詢太寬泛 + 結果很多 → 不需要 Layer 2 =====
-        # 情況 H：查詢詞數很少（<= 3）且結果多（>= 10）
+        # ===== 優先級 7：查詢太寬泛 + 結果很多 → 不需要 Layer 2 =====
+        # 情況 G：查詢詞數很少（<= 3）且結果多（>= 10）
         query_words = len([w for w in query if w.strip()])
         if query_words <= 10 and len(layer1_docs) >= 10:
             # 寬泛查詢，Layer 1 足夠

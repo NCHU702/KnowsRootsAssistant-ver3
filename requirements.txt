@@ -27,3 +27,12 @@ werkzeug
 
 # Web server
 Flask
+
+# Testing
+pytest>=7.0.0
+pytest-mock>=3.10.0
+pytest-cov>=4.0.0
+
+# PDF processing (for summarization)
+PyMuPDF>=1.23.0
+

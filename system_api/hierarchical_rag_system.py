@@ -80,6 +80,19 @@ HIERARCHICAL_RAG_CONFIG = {
         'timeout': 30,
         'max_candidates': 300,  # 最大候選區塊數（避免 re-ranking 太慢）
         'cache_limit_mb': 100,  # JSONL 快取大小限制（MB）
+    },
+    'chunking': {
+        'mode': 'naive',  # 'naive' or 'summarization' (default: naive for backward compatibility)
+        'summarization': {
+            'enabled': False,  # 是否啟用摘要式分塊（實驗性功能）
+            'model': 'llama3:8b',  # Ollama model for summarization
+            'section_parser': 'pymupdf_regex',  # 'pymupdf_regex' or 'grobid'
+            'min_sections': 3,  # Minimum sections to consider PDF structured
+            'map_reduce_threshold': 1500,  # Char count threshold for Map-Reduce
+            'target_summary_length': 300,  # Target summary length in chars
+            'store_original': False,  # Whether to store original full text
+            'ollama_base_url': 'http://localhost:11434',
+        }
     }
 }
 
@@ -157,9 +170,21 @@ class HierarchicalRAGSystem:
             vectorstore_path=os.path.join(vectorstore_path, "layer1")
         )
         
-        # Initialize Layer 2 with optional re-ranking
+        # Initialize Layer 2 with optional re-ranking and chunking config
         reranking_config = self.config.get('layer2_reranking', {})
         use_reranker = reranking_config.get('enabled', False)
+        
+        # Prepare chunking config
+        chunking_settings = self.config.get('chunking', {})
+        chunking_mode = chunking_settings.get('mode', 'naive')
+        chunking_config = None
+        if chunking_mode == 'summarization':
+            chunking_config = {
+                'mode': 'summarization',
+                **chunking_settings.get('summarization', {})
+            }
+        else:
+            chunking_config = {'mode': 'naive'}
         
         self.layer2 = Layer2VectorStore(
             embeddings=self.embeddings,
@@ -168,7 +193,8 @@ class HierarchicalRAGSystem:
             chunk_overlap=chunk_overlap,
             cache_size=self.config['performance']['cache_size'],
             use_reranker=use_reranker,
-            reranker_config=reranking_config if use_reranker else None
+            reranker_config=reranking_config if use_reranker else None,
+            chunking_config=chunking_config
         )
         
         self.confidence_evaluator = ConfidenceEvaluator(self.evaluation_llm)

@@ -84,10 +84,30 @@ try:
                 'timeout': 30,
                 'max_candidates': 300,
                 'cache_limit_mb': 100,
+            },
+            'chunking': {
+                # 分塊策略：'naive' (傳統固定大小) 或 'summarization' (段落摘要)
+                'mode': os.getenv('CHUNKING_MODE', 'summarization'),  # 預設: naive (向後兼容)
+                'summarization': {
+                    'model': os.getenv('SUMMARIZATION_MODEL', 'llama3.2:latest'),  # 摘要使用的 LLM (使用與 agent 相同的模型)
+                    'section_parser': 'pymupdf_regex',  # PDF 段落解析方法
+                    'min_sections': int(os.getenv('MIN_SECTIONS', '3')),  # 最少段落數
+                    'map_reduce_threshold': int(os.getenv('MAP_REDUCE_THRESHOLD', '3000')),  # Map-Reduce 閾值
+                    'target_summary_length': int(os.getenv('TARGET_SUMMARY_LENGTH', '300')),  # 目標摘要長度
+                    'ollama_base_url': 'http://localhost:11434',
+                    'store_original': False  # 是否存儲原始文本
+                }
             }
         }
     )
+    
+    # 顯示分塊模式資訊
+    chunking_mode = os.getenv('CHUNKING_MODE', 'naive')
     logger.info("✓ Hierarchical RAG System initialized successfully")
+    logger.info(f"  Chunking Mode: {chunking_mode.upper()}")
+    if chunking_mode == 'summarization':
+        logger.info(f"  Summarization Model: {os.getenv('SUMMARIZATION_MODEL', 'llama3:8b')}")
+        logger.info(f"  Target Summary Length: {os.getenv('TARGET_SUMMARY_LENGTH', '300')} chars")
     
     # 智能檢查並更新索引
     logger.info("Checking index status...")
@@ -1192,6 +1212,13 @@ if __name__ == '__main__':
     print("\n📊 System Status:")
     print(f"  RAG Mode: HIERARCHICAL (HierarchicalRAGSystem)")
     print(f"  RAG System: {'✓ Ready' if rag_system else '✗ Failed'}")
+    
+    # 顯示分塊模式
+    chunking_mode = os.getenv('CHUNKING_MODE', 'naive')
+    print(f"  Chunking Mode: {chunking_mode.upper()}")
+    if chunking_mode == 'summarization':
+        print(f"    └─ Model: {os.getenv('SUMMARIZATION_MODEL', 'llama3:8b')}")
+        print(f"    └─ Summary Length: {os.getenv('TARGET_SUMMARY_LENGTH', '300')} chars")
     
     if rag_system:
         try:
