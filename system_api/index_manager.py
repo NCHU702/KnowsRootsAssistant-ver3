@@ -16,6 +16,7 @@ from pathlib import Path
 from system_api.layer1_vectorstore import Layer1VectorStore
 from system_api.layer2_vectorstore import Layer2VectorStore
 from system_api.abstract_extractor import AbstractExtractor
+from system_api.text_preprocessor import TextPreprocessor
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ class IndexManager:
         self.layer1 = layer1
         self.layer2 = layer2
         self.abstract_extractor = abstract_extractor
+        self.text_preprocessor = TextPreprocessor()
         self.backup_dir = backup_dir
         self.max_backups = max_backups
         
@@ -94,11 +96,17 @@ class IndexManager:
             backup_id = self._create_backup()
             logger.info(f"  ✓ Backup created: {backup_id}")
             
-            # Step 2: Extract abstract
-            logger.info("Step 2: Extracting abstract...")
+            # Step 2: Preprocess text
+            logger.info("Step 2: Preprocessing text...")
+            cleaned_text, preprocess_stats = self.text_preprocessor.preprocess(pdf_text)
+            logger.info(f"  ✓ Preprocessed: {preprocess_stats['original_length']} → {preprocess_stats['final_length']} chars "
+                       f"(removed: {preprocess_stats.get('removed_percentage', 0):.1f}%)")
+            
+            # Step 3: Extract abstract (use original text)
+            logger.info("Step 3: Extracting abstract...")
             abstract_result = self.abstract_extractor.extract(
                 pdf_path=pdf_path,
-                pdf_text=pdf_text,
+                pdf_text=pdf_text,  # Use original text for abstract extraction
                 paper_id=paper_id
             )
             
@@ -111,12 +119,12 @@ class IndexManager:
             
             logger.info(f"  ✓ Abstract extracted: {abstract_result['source']} (confidence: {abstract_result['confidence']:.2f})")
             
-            # Step 3: Create chunks
-            logger.info("Step 3: Creating chunks...")
+            # Step 4: Create chunks (use cleaned text)
+            logger.info("Step 4: Creating chunks...")
             from langchain_core.documents import Document
             
             chunks = self.layer2.text_splitter.create_documents(
-                texts=[pdf_text],
+                texts=[cleaned_text],  # Use preprocessed text for chunking
                 metadatas=[{
                     'paper_id': paper_id,
                     'pdf_path': pdf_path,
@@ -131,8 +139,8 @@ class IndexManager:
             
             logger.info(f"  ✓ Created {len(chunks)} chunks")
             
-            # Step 4: Add to Layer 1
-            logger.info("Step 4: Adding to Layer 1...")
+            # Step 5: Add to Layer 1
+            logger.info("Step 5: Adding to Layer 1...")
             success = self.layer1.add_abstract(abstract_result)
             
             if not success:
@@ -140,8 +148,8 @@ class IndexManager:
             
             logger.info("  ✓ Added to Layer 1")
             
-            # Step 5: Add to Layer 2
-            logger.info("Step 5: Adding to Layer 2...")
+            # Step 6: Add to Layer 2
+            logger.info("Step 6: Adding to Layer 2...")
             success = self.layer2.add_chunks(chunks)
             
             if not success:

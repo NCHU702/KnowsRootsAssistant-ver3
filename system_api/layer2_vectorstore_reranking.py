@@ -134,11 +134,6 @@ class Layer2VectorStore:
             self._chunk_count = 0
             self._paper_count = 0
     
-    @property
-    def is_initialized(self) -> bool:
-        """檢查索引是否已初始化"""
-        return os.path.exists(self.jsonl_file) and self._chunk_count > 0
-    
     def build_index(self, documents: List[Document]) -> bool:
         """
         建構索引（存儲所有 chunks 到 JSONL）
@@ -258,8 +253,7 @@ class Layer2VectorStore:
         self,
         query: str,
         k: int = 10,
-        filter_paper_ids: Optional[List[str]] = None,
-        paper_ids: Optional[List[str]] = None  # 向後兼容
+        paper_ids: Optional[List[str]] = None
     ) -> List[Document]:
         """
         搜索相關 chunks（使用 re-ranking）
@@ -267,23 +261,19 @@ class Layer2VectorStore:
         Args:
             query: 查詢文本
             k: 返回結果數量
-            filter_paper_ids: 過濾的 paper IDs（None = 搜索全部）
-            paper_ids: 別名，向後兼容
+            paper_ids: 過濾的 paper IDs（None = 搜索全部）
             
         Returns:
             相關文檔列表
         """
-        # 向後兼容：如果提供了 paper_ids，使用它
-        filter_ids = filter_paper_ids if filter_paper_ids is not None else paper_ids
-        results = self.search_with_scores(query, k, filter_ids)
+        results = self.search_with_scores(query, k, paper_ids)
         return [doc for doc, score in results]
     
     def search_with_scores(
         self,
         query: str,
         k: int = 10,
-        filter_paper_ids: Optional[List[str]] = None,
-        paper_ids: Optional[List[str]] = None  # 向後兼容
+        paper_ids: Optional[List[str]] = None
     ) -> List[Tuple[Document, float]]:
         """
         搜索相關 chunks 並返回分數
@@ -291,22 +281,19 @@ class Layer2VectorStore:
         Args:
             query: 查詢文本
             k: 返回結果數量
-            filter_paper_ids: 過濾的 paper IDs（None = 搜索全部）
-            paper_ids: 別名，向後兼容
+            paper_ids: 過濾的 paper IDs（None = 搜索全部）
             
         Returns:
             (Document, score) 列表，按分數降序排列
         """
-        # 向後兼容：如果提供了 paper_ids，使用它
-        filter_ids = filter_paper_ids if filter_paper_ids is not None else paper_ids
         try:
             start_time = time.time()
             
             # 載入候選 chunks
-            candidate_chunks = self._document_store.get_chunks_by_paper_ids(filter_ids)
+            candidate_chunks = self._document_store.get_chunks_by_paper_ids(paper_ids)
             
             if not candidate_chunks:
-                logger.warning(f"No chunks found for papers: {filter_ids}")
+                logger.warning(f"No chunks found for papers: {paper_ids}")
                 return []
             
             # 限制候選數量以避免太慢
@@ -315,19 +302,18 @@ class Layer2VectorStore:
                 logger.info(f"Limiting candidates from {len(candidate_chunks)} to {max_candidates}")
                 candidate_chunks = candidate_chunks[:max_candidates]
             
-            # Re-rank（rank_chunks 需要 dict 格式）
-            reranked_results = self._reranker.rank_chunks(
+            # 轉換為 Documents
+            candidate_docs = [
+                Document(page_content=chunk['text'], metadata=chunk['metadata'])
+                for chunk in candidate_chunks
+            ]
+            
+            # Re-rank
+            reranked_results = self._reranker.rerank(
                 query=query,
-                chunks=candidate_chunks,  # 直接使用 dict 格式
+                documents=candidate_docs,
                 top_k=k
             )
-            
-            # 轉換結果為 (Document, score) 格式
-            results_with_docs = [
-                (Document(page_content=chunk_dict['text'], metadata=chunk_dict['metadata']), score)
-                for chunk_dict, score in reranked_results
-            ]
-            reranked_results = results_with_docs
             
             elapsed = time.time() - start_time
             logger.info(f"Re-ranking search completed in {elapsed:.3f}s")
@@ -337,43 +323,6 @@ class Layer2VectorStore:
             
         except Exception as e:
             logger.error(f"Search failed: {e}", exc_info=True)
-            return []
-    
-    def get_chunks_by_ids(self, chunk_ids: List[str]) -> List[Document]:
-        """
-        根據 chunk_id 列表檢索特定的 chunks
-        
-        Args:
-            chunk_ids: Chunk ID 列表（例如 ["paper1_chunk_0", "paper2_chunk_1"]）
-            
-        Returns:
-            找到的 Document 列表
-        """
-        if not self.is_initialized:
-            logger.warning("Index not initialized")
-            return []
-        
-        try:
-            found_docs = []
-            
-            # Read all chunks from JSONL (pass None to get all)
-            all_chunks = self._document_store.get_chunks_by_paper_ids(None)
-            
-            # Filter by chunk_ids
-            for chunk in all_chunks:
-                chunk_id = chunk.get('chunk_id')
-                if chunk_id in chunk_ids:
-                    doc = Document(
-                        page_content=chunk['text'],
-                        metadata=chunk
-                    )
-                    found_docs.append(doc)
-            
-            logger.debug(f"Found {len(found_docs)}/{len(chunk_ids)} chunks by IDs")
-            return found_docs
-            
-        except Exception as e:
-            logger.error(f"Failed to get chunks by IDs: {e}")
             return []
     
     def get_surrounding_context(
@@ -410,20 +359,7 @@ class Layer2VectorStore:
                 Document(page_content=c['text'], metadata=c['metadata'])
                 for c in paper_chunks
             ]
-            
-            # 排序函數：從 chunk_id 字串中提取數字
-            def extract_chunk_index(doc):
-                chunk_id_str = doc.metadata.get('chunk_id', '')
-                if isinstance(chunk_id_str, str) and '_chunk_' in chunk_id_str:
-                    try:
-                        return int(chunk_id_str.split('_chunk_')[-1])
-                    except:
-                        return 0
-                elif isinstance(chunk_id_str, int):
-                    return chunk_id_str
-                return 0
-            
-            docs.sort(key=extract_chunk_index)
+            docs.sort(key=lambda d: d.metadata.get('chunk_id', 0))
             
             # 找到目標位置
             target_idx = None
@@ -448,98 +384,6 @@ class Layer2VectorStore:
         except Exception as e:
             logger.error(f"Failed to get surrounding context: {e}", exc_info=True)
             return [target_chunk]
-
-    def get_surrounding_chunks(
-        self,
-        paper_id: str = None,
-        chunk_id: int = None,
-        before: int = 1,
-        after: int = 1,
-        target_chunk: Document = None,
-        window_size: int = None
-    ) -> str:
-        """
-        兼容舊介面：獲取周圍 chunks 並返回拼接的文本
-        
-        支援兩種調用方式：
-        1. get_surrounding_chunks(paper_id='xxx', chunk_id=0, before=2, after=2)
-        2. get_surrounding_chunks(target_chunk=doc, window_size=2)
-        
-        Args:
-            paper_id: Paper ID (舊接口)
-            chunk_id: Chunk ID (舊接口)
-            before: 前面取多少個 chunks (舊接口)
-            after: 後面取多少個 chunks (舊接口)
-            target_chunk: 目標 Document (新接口)
-            window_size: 窗口大小 (新接口)
-            
-        Returns:
-            拼接後的文本字串
-        """
-        # 如果使用新接口
-        if target_chunk is not None:
-            if window_size is None:
-                window_size = 1
-            context_docs = self.get_surrounding_context(target_chunk, window_size)
-            return "\n\n".join(doc.page_content for doc in context_docs)
-        
-        # 使用舊接口
-        if not paper_id or chunk_id is None:
-            logger.warning("Missing paper_id or chunk_id")
-            return ""
-        
-        try:
-            # 獲取該論文的所有 chunks
-            paper_chunks = self._document_store.get_chunks_by_paper_ids([paper_id])
-            
-            if not paper_chunks:
-                return ""
-            
-            # 轉換並排序
-            docs = [
-                Document(page_content=c['text'], metadata=c['metadata'])
-                for c in paper_chunks
-            ]
-            
-            # 排序函數：從 chunk_id 字串中提取數字
-            def extract_chunk_index(doc):
-                chunk_id_str = doc.metadata.get('chunk_id', '')
-                if isinstance(chunk_id_str, str) and '_chunk_' in chunk_id_str:
-                    try:
-                        return int(chunk_id_str.split('_chunk_')[-1])
-                    except:
-                        return 0
-                elif isinstance(chunk_id_str, int):
-                    return chunk_id_str
-                return 0
-            
-            docs.sort(key=extract_chunk_index)
-            
-            # 找到目標位置（chunk_id 可能是整數或字串）
-            target_idx = None
-            for idx, doc in enumerate(docs):
-                doc_chunk_id = doc.metadata.get('chunk_id', '')
-                # 支援兩種格式：整數或 "paper_id_chunk_N"
-                if doc_chunk_id == chunk_id or extract_chunk_index(doc) == chunk_id:
-                    target_idx = idx
-                    break
-            
-            if target_idx is None:
-                logger.warning(f"Chunk {chunk_id} not found in paper {paper_id}")
-                return ""
-            
-            # 取窗口
-            start_idx = max(0, target_idx - before)
-            end_idx = min(len(docs), target_idx + after + 1)
-            
-            context_chunks = docs[start_idx:end_idx]
-            
-            # 拼接文本
-            return "\n\n".join(doc.page_content for doc in context_chunks)
-            
-        except Exception as e:
-            logger.error(f"Failed to get surrounding chunks: {e}", exc_info=True)
-            return ""
     
     def load_index(self) -> bool:
         """
@@ -577,15 +421,6 @@ class Layer2VectorStore:
         except Exception as e:
             logger.error(f"Failed to save index: {e}", exc_info=True)
             return False
-    
-    # 向後兼容的別名方法
-    def load(self) -> bool:
-        """別名方法：向後兼容 HierarchicalRAGSystem"""
-        return self.load_index()
-    
-    def save(self) -> bool:
-        """別名方法：向後兼容 HierarchicalRAGSystem"""
-        return self.save_index()
     
     def get_stats(self) -> Dict[str, Any]:
         """獲取統計信息"""

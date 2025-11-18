@@ -50,7 +50,7 @@ try:
                 'similarity_threshold': 0.5  # 降低閾值（純語義策略下需要更寬鬆）
             },
             'layer2': {
-                'k_documents': int(os.getenv('LAYER2_K_DOCUMENTS', '2')),  # 限制為 2 個 chunks
+                'k_documents': int(os.getenv('LAYER2_K_DOCUMENTS', '10')),
                 'confidence_threshold': float(os.getenv('LAYER2_THRESHOLD', '0.6'))
             },
             'expansion': {
@@ -182,7 +182,7 @@ def assistant_call(user_input: str) -> str:
     
     # Wait for RAG to complete
     logger.info("⏳ Waiting for RAG streaming to complete...")
-    success = _rag_completion_event.wait(timeout=300)  # Wait up to 5 minutes (LLM can be slow)
+    success = _rag_completion_event.wait(timeout=120)  # Wait up to 2 minutes
     
     if success:
         logger.info("✓ RAG streaming completed, returning status message")
@@ -190,7 +190,7 @@ def assistant_call(user_input: str) -> str:
         # The actual content was already streamed to the user
         result = "[RAG retrieval completed - answer has been streamed to user]"
     else:
-        logger.warning("⚠️ RAG streaming timeout after 300s")
+        logger.warning("⚠️ RAG streaming timeout after 120s")
         result = "處理超時，請重試。"
     
     # Clear for next call
@@ -475,18 +475,13 @@ def query_stream():
                                         if chunk:
                                             yield f"data: {json.dumps({'type': 'tool_token', 'tool': 'AssistantCall', 'content': chunk})}\n\n"
                                             final_answer_buffer += chunk
-                                            # Check if buffer still exists (not cleared by timeout)
-                                            if _rag_result_buffer is not None:
-                                                _rag_result_buffer += chunk
+                                            _rag_result_buffer += chunk
                                             chunk_count += 1
                                     
                                     logger.info(f"✓ RAG streaming completed: {chunk_count} chunks streamed")
                                     
-                                    # Signal completion to assistant_call (if event still exists)
-                                    if _rag_completion_event is not None:
-                                        _rag_completion_event.set()
-                                    else:
-                                        logger.warning("⚠️ RAG completion event was already cleared (timeout)")
+                                    # Signal completion to assistant_call
+                                    _rag_completion_event.set()
                                     
                                     final_answer_started = True
                                 except GeneratorExit:
@@ -598,7 +593,6 @@ def categories_data_endpoint():
         
         # Extract unique values for each filter
         purposes = set()
-        years = set()
         datasets = set()
         models = set()
         

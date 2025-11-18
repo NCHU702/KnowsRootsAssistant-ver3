@@ -27,6 +27,8 @@ from system_api.hybrid_retriever import HybridRetriever
 from system_api.query_expander import QueryExpander
 from system_api.adaptive_weights import AdaptiveWeightAdjuster
 from system_api.layer2_trigger import Layer2TriggerDecision
+from system_api.text_preprocessor import TextPreprocessor
+from system_api.index_manager import IndexManager
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +71,15 @@ HIERARCHICAL_RAG_CONFIG = {
     'performance': {
         'use_cache': True,
         'cache_size': 10,
+    },
+    'layer2_reranking': {
+        'enabled': False,  # 是否啟用 Cross-Encoder Re-ranking（實驗性功能）
+        'model': 'qllama/bce-reranker-base_v1:latest',
+        'ollama_base_url': 'http://localhost:11434',
+        'max_length': 512,
+        'timeout': 30,
+        'max_candidates': 300,  # 最大候選區塊數（避免 re-ranking 太慢）
+        'cache_limit_mb': 100,  # JSONL 快取大小限制（MB）
     }
 }
 
@@ -129,27 +140,35 @@ class HierarchicalRAGSystem:
         
         # LLM and Embeddings
         # Note: OllamaLLM uses temperature parameter during initialization, not per-call
-        self.llm = OllamaLLM(model=model_name)
+        # Set num_ctx to 4096 for faster generation (13K chars ≈ 3.5K tokens should fit)
+        self.llm = OllamaLLM(model=model_name, num_ctx=4096)
         self.embeddings = OllamaEmbeddings(model=embedding_model)
         
         # Separate LLM for confidence evaluation (use same model, deterministic mode preferred)
         # Note: If temperature is not supported, rely on model's default behavior
-        self.evaluation_llm = OllamaLLM(model=model_name)
+        self.evaluation_llm = OllamaLLM(model=model_name, num_ctx=8192)
         
         # Core components
         self.abstract_extractor = AbstractExtractor(self.llm)
+        self.text_preprocessor = TextPreprocessor()
         
         self.layer1 = Layer1VectorStore(
             embeddings=self.embeddings,
             vectorstore_path=os.path.join(vectorstore_path, "layer1")
         )
         
+        # Initialize Layer 2 with optional re-ranking
+        reranking_config = self.config.get('layer2_reranking', {})
+        use_reranker = reranking_config.get('enabled', False)
+        
         self.layer2 = Layer2VectorStore(
             embeddings=self.embeddings,
             vectorstore_path=os.path.join(vectorstore_path, "layer2"),
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
-            cache_size=self.config['performance']['cache_size']
+            cache_size=self.config['performance']['cache_size'],
+            use_reranker=use_reranker,
+            reranker_config=reranking_config if use_reranker else None
         )
         
         self.confidence_evaluator = ConfidenceEvaluator(self.evaluation_llm)
@@ -158,6 +177,16 @@ class HierarchicalRAGSystem:
         # Layer 2 觸發決策器
         self.layer2_trigger = Layer2TriggerDecision(llm=self.llm)
         logger.info("✓ Layer 2 Trigger Decision initialized")
+        
+        # Index Manager (for incremental document updates)
+        self.index_manager = IndexManager(
+            layer1=self.layer1,
+            layer2=self.layer2,
+            abstract_extractor=self.abstract_extractor,
+            backup_dir=os.path.join(vectorstore_path, "backups"),
+            max_backups=5
+        )
+        logger.info("✓ Index Manager initialized")
         
         # Query expansion and adaptive weights
         self.query_expander: Optional[QueryExpander] = None
@@ -288,10 +317,15 @@ class HierarchicalRAGSystem:
                 # Generate paper_id from filename
                 paper_id = os.path.splitext(os.path.basename(pdf_path))[0]
                 
-                # Extract abstract (for Layer 1)
+                # Preprocess text: Remove references and appendix
+                cleaned_text, preprocess_stats = self.text_preprocessor.preprocess(pdf_text)
+                logger.info(f"  ✓ Preprocessed: {preprocess_stats['original_length']} → {preprocess_stats['final_length']} chars "
+                           f"(removed: {preprocess_stats.get('removed_percentage', 0):.1f}%)")
+                
+                # Extract abstract (for Layer 1) - use original text for better abstract extraction
                 abstract_result = self.abstract_extractor.extract(
                     pdf_path=pdf_path,
-                    pdf_text=pdf_text,
+                    pdf_text=pdf_text,  # Use original text for abstract extraction
                     paper_id=paper_id
                 )
                 
@@ -303,9 +337,9 @@ class HierarchicalRAGSystem:
                     abstracts.append(abstract_result)
                     logger.info(f"  ✓ Abstract: {abstract_result['source']} (confidence: {abstract_result['confidence']:.2f})")
                 
-                # Split into chunks (for Layer 2)
+                # Split into chunks (for Layer 2) - use cleaned text
                 chunks = self.layer2.text_splitter.create_documents(
-                    texts=[pdf_text],
+                    texts=[cleaned_text],  # Use preprocessed text for chunking
                     metadatas=[{
                         'paper_id': paper_id,
                         'pdf_path': pdf_path,
@@ -373,6 +407,85 @@ class HierarchicalRAGSystem:
             'chunks_created': len(all_chunks),
             'stats': stats
         }
+    
+    def add_document(self, pdf_path: str) -> Dict[str, Any]:
+        """
+        Add a single PDF to existing vectorstore using IndexManager
+        
+        This method provides incremental document addition with:
+        - Automatic backup before changes
+        - Text preprocessing (removes appendix, references, etc.)
+        - Abstract extraction and Layer 1 indexing
+        - Chunk creation and Layer 2 indexing
+        - Transactional safety with rollback on failure
+        
+        Args:
+            pdf_path: Absolute path to PDF file
+            
+        Returns:
+            Dictionary with status and statistics:
+            {
+                'status': 'success' or 'error',
+                'duration_seconds': float,
+                'paper_id': str,
+                'chunks_added': int,
+                'backup_id': str,
+                'error': str (if failed)
+            }
+        """
+        start_time = time.time()
+        
+        try:
+            if not os.path.exists(pdf_path):
+                raise FileNotFoundError(f"PDF not found: {pdf_path}")
+            
+            logger.info(f"Adding document to Hierarchical RAG: {pdf_path}")
+            
+            # Extract PDF text
+            from langchain_community.document_loaders import PyMuPDFLoader
+            loader = PyMuPDFLoader(pdf_path)
+            pages = loader.load()
+            pdf_text = "\n".join([page.page_content for page in pages])
+            
+            # Generate paper ID
+            import hashlib
+            paper_id = hashlib.md5(pdf_path.encode()).hexdigest()[:16]
+            
+            # Extract metadata
+            paper_metadata = {
+                'title': os.path.basename(pdf_path).replace('.pdf', ''),
+                'pdf_path': pdf_path,
+                'source_file': os.path.basename(pdf_path)
+            }
+            
+            # Use IndexManager to add document (includes text preprocessing)
+            result = self.index_manager.add_document(
+                pdf_path=pdf_path,
+                pdf_text=pdf_text,
+                paper_id=paper_id,
+                paper_metadata=paper_metadata
+            )
+            
+            # Update hybrid retriever if enabled
+            if self.hybrid_retriever and result['status'] == 'success':
+                logger.info("Rebuilding BM25 index for hybrid search...")
+                self.hybrid_retriever.build_bm25_index()
+            
+            duration = time.time() - start_time
+            result['duration_seconds'] = duration
+            
+            logger.info(f"Document added successfully in {duration:.1f}s")
+            
+            return result
+            
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(f"Failed to add document: {e}")
+            return {
+                'status': 'error',
+                'error': str(e),
+                'duration_seconds': duration
+            }
     
     def _get_all_pdfs(self) -> List[str]:
         """Get all PDF files in pdf_directory"""
@@ -680,20 +793,88 @@ class HierarchicalRAGSystem:
             paper_ids = [doc.metadata['paper_id'] for doc in layer1_docs]
             logger.info(f"Filtering by {len(paper_ids)} papers from Layer 1")
             
-            k2 = self.config['layer2']['k_documents']
-            layer2_results_with_scores = self.layer2.search_with_scores(
-                query=query,
-                k=k2,
-                filter_paper_ids=paper_ids
-            )
+            # Strategy: Retrieve top-2 chunks PER PAPER (not globally)
+            CHUNKS_PER_PAPER = 2
+            logger.info(f"📋 Strategy: Retrieve top-{CHUNKS_PER_PAPER} chunks per paper")
             
-            # 提取文檔
-            layer2_docs = [doc for doc, score in layer2_results_with_scores]
+            # Retrieve chunks for each paper separately
+            layer2_docs_by_paper = {}
+            all_layer2_results = []
+            
+            for paper_id in paper_ids:
+                paper_results = self.layer2.search_with_scores(
+                    query=query,
+                    k=CHUNKS_PER_PAPER,
+                    filter_paper_ids=[paper_id]
+                )
+                
+                if paper_results:
+                    layer2_docs_by_paper[paper_id] = [doc for doc, score in paper_results]
+                    all_layer2_results.extend(paper_results)
+                    logger.info(f"  ✓ {paper_id[:50]}...: {len(paper_results)} chunks")
+            
+            # Combine all results for display
+            layer2_results_with_scores = all_layer2_results
+            layer2_docs = [doc for doc, score in all_layer2_results]
+            
+            # For overview/general queries, ensure abstract chunks are included
+            query_type = trigger_decision['decision_factors']['query_type']
+            if query_type in ['overview', 'general']:
+                logger.info("🔍 Overview query detected - ensuring abstract chunks are included")
+                logger.info(f"  Paper IDs to check: {paper_ids}")
+                
+                # Find abstract chunks (chunk_0, chunk_1, or chunks with 'abstract' in content)
+                abstract_chunks = []
+                for paper_id in paper_ids:
+                    # Try to get chunk_0 or chunk_1 from this paper
+                    for chunk_num in [0, 1, 2]:
+                        chunk_id_to_find = f"{paper_id}_chunk_{chunk_num}"
+                        
+                        logger.debug(f"  Looking for: {chunk_id_to_find}")
+                        
+                        # Check if already in results
+                        already_included = any(
+                            doc.metadata.get('chunk_id') == chunk_id_to_find 
+                            for doc in layer2_docs
+                        )
+                        
+                        if already_included:
+                            logger.info(f"  ✓ Abstract chunk already in results: {chunk_id_to_find}")
+                            break
+                        else:
+                            # Try to retrieve this chunk from Layer 2 store
+                            try:
+                                chunk_docs = self.layer2.get_chunks_by_ids([chunk_id_to_find])
+                                if chunk_docs:
+                                    abstract_chunks.extend(chunk_docs)
+                                    logger.info(f"  ✓ Added abstract chunk: {chunk_id_to_find}")
+                                    break  # Found abstract for this paper
+                                else:
+                                    logger.debug(f"  ✗ Chunk not found: {chunk_id_to_find}")
+                            except Exception as e:
+                                logger.debug(f"  ✗ Error retrieving {chunk_id_to_find}: {e}")
+                
+                # Prepend abstract chunks to results (they should come first for this paper)
+                if abstract_chunks:
+                    logger.info(f"  → Total {len(abstract_chunks)} abstract chunks prepended")
+                    # Add to this paper's results
+                    if paper_id in layer2_docs_by_paper:
+                        layer2_docs_by_paper[paper_id] = abstract_chunks + layer2_docs_by_paper[paper_id]
+                        # Limit to CHUNKS_PER_PAPER per paper
+                        layer2_docs_by_paper[paper_id] = layer2_docs_by_paper[paper_id][:CHUNKS_PER_PAPER]
+                else:
+                    logger.warning("  ⚠️ No abstract chunks found to prepend")
+            
+            # Flatten all paper chunks for evaluation
+            layer2_docs = []
+            for paper_id, chunks in layer2_docs_by_paper.items():
+                layer2_docs.extend(chunks)
             
             result['timings']['layer2_retrieval'] = time.time() - layer2_start
             result['layers_used'].append('layer2')
+            result['layer2_docs_by_paper'] = layer2_docs_by_paper  # Store per-paper structure
             
-            logger.info(f"Retrieved {len(layer2_docs)} chunks")
+            logger.info(f"Retrieved {len(layer2_docs)} chunks total from {len(layer2_docs_by_paper)} papers")
             
             # 顯示前 5 名相似度最高的文檔片段
             if layer2_results_with_scores:
@@ -734,29 +915,34 @@ class HierarchicalRAGSystem:
             logger.info(f"  Reasoning: {evaluation2['reasoning'][:100]}...")
             
             # ============================================================
-            # CONTEXT EXPANSION
+            # CONTEXT EXPANSION (Per Paper)
             # ============================================================
-            if self.config['expansion']['enabled']:
-                logger.info("\n" + "="*60)
-                logger.info("CONTEXT EXPANSION")
-                logger.info("="*60)
-                
-                expand_start = time.time()
-                
-                expanded_contexts = self.context_expander.expand(
-                    chunks=layer2_docs,
-                    confidence=evaluation2['confidence']
-                )
-                
-                result['timings']['expansion'] = time.time() - expand_start
-                result['expanded_contexts'] = expanded_contexts
-                
-                stats = self.context_expander.get_expansion_stats(evaluation2['confidence'])
-                logger.info(f"Expanded {len(expanded_contexts)} contexts")
-                logger.info(f"  Strategy: {stats['strategy']}")
-                logger.info(f"  Range: ±{stats['expansion_range']} chunks")
-            else:
-                result['expanded_contexts'] = [doc.page_content for doc in layer2_docs]
+            logger.info("\n" + "="*60)
+            logger.info("CONTEXT EXPANSION (Per Paper)")
+            logger.info("="*60)
+            
+            expand_start = time.time()
+            expanded_contexts_by_paper = {}
+            
+            for paper_id, paper_chunks in layer2_docs_by_paper.items():
+                if self.config['expansion']['enabled']:
+                    paper_expanded = self.context_expander.expand(
+                        chunks=paper_chunks,
+                        confidence=evaluation2['confidence']
+                    )
+                    expanded_contexts_by_paper[paper_id] = paper_expanded
+                    logger.info(f"  ✓ {paper_id[:50]}...: {len(paper_expanded)} contexts")
+                else:
+                    expanded_contexts_by_paper[paper_id] = [doc.page_content for doc in paper_chunks]
+            
+            result['timings']['expansion'] = time.time() - expand_start
+            result['expanded_contexts_by_paper'] = expanded_contexts_by_paper
+            
+            stats = self.context_expander.get_expansion_stats(evaluation2['confidence'])
+            logger.info(f"Expansion complete:")
+            logger.info(f"  Strategy: {stats['strategy']}")
+            logger.info(f"  Range: ±{stats['expansion_range']} chunks")
+            logger.info(f"  Total papers: {len(expanded_contexts_by_paper)}")
             
             # Final results
             result['final_docs'] = layer2_docs
@@ -916,48 +1102,105 @@ Answer:"""
             
             yield "\n" + "="*60 + "\n\n"
         
-        # Format context
-        if 'expanded_contexts' in retrieval_result:
-            contexts = retrieval_result['expanded_contexts']
-        else:
-            contexts = [doc.page_content for doc in retrieval_result['final_docs']]
-        
-        context_text = "\n\n".join([f"[Context {i+1}]\n{ctx}" for i, ctx in enumerate(contexts)])
-        
-        # Create prompt based on language
-        if is_chinese_query:
-            prompt = f"""你是一個學術研究助手。請根據以下研究論文的內容回答問題。
-
-【重要】請務必使用「繁體中文（Traditional Chinese）」回答，不要使用簡體中文。
+        # Check if we have per-paper contexts (Layer 2 with multiple papers)
+        if 'expanded_contexts_by_paper' in retrieval_result:
+            # Multiple papers: Generate answer for each paper separately
+            expanded_contexts_by_paper = retrieval_result['expanded_contexts_by_paper']
+            
+            logger.info(f"📝 Generating answers for {len(expanded_contexts_by_paper)} papers separately")
+            
+            for paper_idx, (paper_id, contexts) in enumerate(expanded_contexts_by_paper.items(), 1):
+                # Paper header
+                if is_chinese_query:
+                    yield f"\n{'='*60}\n"
+                    yield f"📄 論文 {paper_idx}/{len(expanded_contexts_by_paper)}: {paper_id}\n"
+                    yield f"{'='*60}\n\n"
+                else:
+                    yield f"\n{'='*60}\n"
+                    yield f"📄 Paper {paper_idx}/{len(expanded_contexts_by_paper)}: {paper_id}\n"
+                    yield f"{'='*60}\n\n"
+                
+                # Format context for this paper
+                context_text = "\n\n".join([f"[Context {i+1}]\n{ctx}" for i, ctx in enumerate(contexts)])
+                
+                # Debug log
+                logger.info(f"📝 Paper {paper_idx} context:")
+                logger.info(f"  Number of contexts: {len(contexts)}")
+                logger.info(f"  Total context length: {len(context_text)} chars")
+                
+                # Create prompt
+                if is_chinese_query:
+                    prompt = f"""你是一個學術研究助手。以下是從一篇學術論文中擷取的相關段落，請根據這些段落回答問題。
 
 問題：{query}
 
-參考文獻內容：
+論文相關段落：
 {context_text}
 
-請根據以上內容提供完整的答案。如果內容不足以回答問題，請明確說明。
-記住：回答必須使用繁體中文，例如「應用」而非「应用」，「資料」而非「数据」。
-
-回答："""
-        else:
-            prompt = f"""Based on the following research paper contexts, please answer the question.
+請根據以上段落，用繁體中文簡潔回答問題。"""
+                else:
+                    prompt = f"""Based on the following research paper contexts, please answer the question.
 
 Question: {query}
 
 Contexts:
 {context_text}
 
-Please provide a comprehensive answer based on the contexts above. If the contexts don't contain enough information, acknowledge that.
+Please provide a concise answer based on the contexts above.
 
 Answer:"""
+                
+                # Generate answer for this paper
+                try:
+                    for chunk in self.llm.stream(prompt):
+                        yield chunk
+                    yield "\n\n"  # Separate papers
+                except Exception as e:
+                    logger.error(f"Error generating answer for paper {paper_idx}: {e}")
+                    yield f"Error generating answer: {e}\n\n"
         
-        # Generate with streaming
-        try:
-            for chunk in self.llm.stream(prompt):
-                yield chunk
-        except Exception as e:
-            logger.error(f"Streaming answer generation failed: {e}")
-            yield f"Error generating answer: {e}"
+        else:
+            # Single paper or Layer 1 only: Original logic
+            if 'expanded_contexts' in retrieval_result:
+                contexts = retrieval_result['expanded_contexts']
+            else:
+                contexts = [doc.page_content for doc in retrieval_result['final_docs']]
+            
+            context_text = "\n\n".join([f"[Context {i+1}]\n{ctx}" for i, ctx in enumerate(contexts)])
+            
+            logger.info(f"📝 Context for LLM generation:")
+            logger.info(f"  Number of contexts: {len(contexts)}")
+            logger.info(f"  Total context length: {len(context_text)} chars")
+            
+            if is_chinese_query:
+                prompt = f"""你是一個學術研究助手。以下是從學術論文中擷取的相關段落，請根據這些段落回答問題。
+
+問題：{query}
+
+論文相關段落：
+{context_text}
+
+請根據以上段落，用繁體中文完整回答問題。"""
+            else:
+                prompt = f"""Based on the following research paper contexts, please answer the question.
+
+Question: {query}
+
+Contexts:
+{context_text}
+
+Please provide a comprehensive answer based on the contexts above.
+
+Answer:"""
+            
+            logger.info(f"📤 Prompt length: {len(prompt)} chars")
+            
+            try:
+                for chunk in self.llm.stream(prompt):
+                    yield chunk
+            except Exception as e:
+                logger.error(f"Streaming answer generation failed: {e}")
+                yield f"Error generating answer: {e}"
     
     def get_stats(self) -> Dict[str, Any]:
         """Get system statistics"""
@@ -971,6 +1214,14 @@ Answer:"""
     def is_ready(self) -> bool:
         """Check if system is ready for queries"""
         return self.layer1.is_initialized and self.layer2.is_initialized
+    
+    @property
+    def vectorstore(self):
+        """
+        Compatibility property for agent2.py checks
+        Returns Layer 1 vectorstore if initialized, None otherwise
+        """
+        return self.layer1.vectorstore if self.layer1.is_initialized else None
     
     def check_and_update_indices(self, force_rebuild: bool = False) -> Dict[str, Any]:
         """

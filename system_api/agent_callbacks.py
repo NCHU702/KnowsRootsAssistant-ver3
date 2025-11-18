@@ -87,6 +87,16 @@ class AgentStreamCallback(BaseCallbackHandler):
                 logger.info("Stop signal detected after tool execution...")
                 raise KeyboardInterrupt("Execution stopped by user after tool")
             
+            # Special handling for AssistantCall in streaming mode
+            # If output indicates RAG streaming was handled, skip observation
+            if "[RAG retrieval completed" in output:
+                logger.info("RAG streaming completed, skipping observation and finishing agent")
+                # Signal agent to finish without further processing
+                self.queue.put({
+                    'type': 'agent_done'
+                })
+                return
+            
             # Send observation (truncate if too long)
             observation = output[:500] + "..." if len(output) > 500 else output
             
