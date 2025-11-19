@@ -1251,13 +1251,13 @@ Answer:"""
     
     def check_and_update_indices(self, force_rebuild: bool = False) -> Dict[str, Any]:
         """
-        智能檢查索引狀態並更新
+        智能檢查索引狀態並更新（支援增量更新）
         
         檢查項目：
         1. 索引是否存在
         2. 索引是否損壞
-        3. 是否有新增的 PDF
-        4. 索引的 PDF 數量是否匹配
+        3. 是否有新增的 PDF（增量更新）
+        4. 是否有刪除的 PDF（需重建）
         
         Args:
             force_rebuild: 強制重建索引
@@ -1301,24 +1301,114 @@ Answer:"""
             logger.info(f"Current PDF files: {current_count}")
             logger.info(f"Indexed papers: {indexed_count}")
             
-            # 檢查 3: 數量不匹配 = 可能有新增或刪除
+            # 檢查 3: 獲取已索引的 PDF 路徑
             if current_count != indexed_count:
                 logger.warning(f"PDF count mismatch! Current: {current_count}, Indexed: {indexed_count}")
                 
-                if current_count > indexed_count:
-                    logger.info(f"Detected {current_count - indexed_count} new PDF(s)")
-                    result['action_taken'] = 'incremental_update'
-                else:
-                    logger.warning(f"Some PDFs were removed, rebuilding recommended")
-                    result['action_taken'] = 'rebuild'
+                # 從 Layer 1 vectorstore 獲取已索引的 PDF 路徑
+                indexed_pdfs = set()
+                if self.layer1.vectorstore:
+                    try:
+                        # FAISS vectorstore 的正確訪問方式
+                        docstore = self.layer1.vectorstore.docstore
+                        if hasattr(docstore, '_dict'):
+                            all_docs = list(docstore._dict.values())
+                        elif hasattr(docstore, 'search'):
+                            # 如果沒有 _dict，嘗試獲取所有文檔
+                            all_docs = []
+                            for idx in range(indexed_count):
+                                try:
+                                    doc = docstore.search(str(idx))
+                                    if doc:
+                                        all_docs.append(doc)
+                                except:
+                                    continue
+                        else:
+                            logger.warning("Cannot access docstore, will rebuild index")
+                            all_docs = []
+                        
+                        for doc in all_docs:
+                            pdf_path = doc.metadata.get('pdf_path', '')
+                            if pdf_path:
+                                indexed_pdfs.add(pdf_path)
+                    except Exception as e:
+                        logger.error(f"Error reading indexed PDFs: {e}")
                 
-                # 重建索引
-                build_result = self.build_indices()
-                result['status'] = build_result.get('status', 'error')
-                result['details'] = build_result
-                return result
+                logger.info(f"Indexed PDF paths: {len(indexed_pdfs)}")
+                
+                # 檢查 4: 找出新增和刪除的 PDF
+                new_pdfs = current_pdfs - indexed_pdfs
+                removed_pdfs = indexed_pdfs - current_pdfs
+                
+                if removed_pdfs:
+                    logger.warning(f"Detected {len(removed_pdfs)} removed PDF(s):")
+                    for pdf in list(removed_pdfs)[:5]:  # 只顯示前 5 個
+                        logger.warning(f"  - {os.path.basename(pdf)}")
+                    logger.warning("Rebuild required due to removed PDFs")
+                    result['action_taken'] = 'rebuild'
+                    
+                    build_result = self.build_indices()
+                    result['status'] = build_result.get('status', 'error')
+                    result['details'] = build_result
+                    result['details']['removed_pdfs'] = len(removed_pdfs)
+                    return result
+                
+                if new_pdfs:
+                    logger.info(f"✓ Detected {len(new_pdfs)} new PDF(s) - using incremental update")
+                    for pdf in list(new_pdfs)[:5]:  # 只顯示前 5 個
+                        logger.info(f"  + {os.path.basename(pdf)}")
+                    if len(new_pdfs) > 5:
+                        logger.info(f"  ... and {len(new_pdfs) - 5} more")
+                    
+                    result['action_taken'] = 'incremental_update'
+                    
+                    # 增量更新：只處理新增的 PDF
+                    added_count = 0
+                    failed_count = 0
+                    start_time = time.time()
+                    
+                    for i, pdf_path in enumerate(sorted(new_pdfs), 1):
+                        try:
+                            logger.info(f"[{i}/{len(new_pdfs)}] Adding: {os.path.basename(pdf_path)}")
+                            add_result = self.add_document(pdf_path)
+                            if add_result['status'] == 'success':
+                                added_count += 1
+                            else:
+                                failed_count += 1
+                                logger.warning(f"  ✗ Failed: {add_result.get('error', 'Unknown error')}")
+                        except Exception as e:
+                            failed_count += 1
+                            logger.error(f"  ✗ Error adding {os.path.basename(pdf_path)}: {e}")
+                    
+                    duration = time.time() - start_time
+                    
+                    # 更新統計
+                    stats1 = self.layer1.get_stats()
+                    stats2 = self.layer2.get_stats()
+                    
+                    result['status'] = 'success'
+                    result['details'] = {
+                        'new_pdfs_detected': len(new_pdfs),
+                        'successfully_added': added_count,
+                        'failed': failed_count,
+                        'duration': duration,
+                        'layer1': stats1,
+                        'layer2': stats2
+                    }
+                    
+                    logger.info("="*80)
+                    logger.info("Incremental Update Complete")
+                    logger.info(f"  Duration: {duration:.1f}s")
+                    logger.info(f"  Added: {added_count}/{len(new_pdfs)} PDFs")
+                    if failed_count > 0:
+                        logger.warning(f"  Failed: {failed_count} PDFs")
+                    logger.info(f"  Total Papers: {stats1['paper_count']}")
+                    logger.info(f"  Total Chunks: {stats2['chunk_count']}")
+                    logger.info("="*80)
+                    
+                    return result
             
-            # 檢查 4: 驗證索引完整性（簡單檢查）
+            # 檢查 5: 驗證索引完整性
             if not stats1.get('is_initialized') or not stats2.get('is_initialized'):
                 logger.error("Indices appear corrupted")
                 result['status'] = 'corrupted'

@@ -167,12 +167,38 @@ class Layer2VectorStore:
     def _update_statistics(self):
         """更新 chunk 和 paper 統計"""
         try:
-            if os.path.exists(self.jsonl_file):
-                all_chunks = self._document_store.get_chunks_by_paper_ids(None)
-                self._chunk_count = len(all_chunks)
-                paper_ids = set(chunk['metadata'].get('paper_id') for chunk in all_chunks 
-                               if 'paper_id' in chunk.get('metadata', {}))
+            if not os.path.exists(self.jsonl_file):
+                self._chunk_count = 0
+                self._paper_count = 0
+                return
+            
+            # 使用 document_store 的專用方法（更高效）
+            if self._document_store:
+                self._chunk_count = self._document_store.get_chunk_count()
+                self._paper_count = self._document_store.get_paper_count()
+            else:
+                # 後備方案：直接讀取檔案計算
+                logger.warning("Document store not available, using fallback statistics calculation")
+                paper_ids = set()
+                chunk_count = 0
+                with open(self.jsonl_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            import json
+                            chunk_data = json.loads(line)
+                            chunk_count += 1
+                            paper_id = chunk_data.get('paper_id') or chunk_data.get('metadata', {}).get('paper_id')
+                            if paper_id:
+                                paper_ids.add(paper_id)
+                        except Exception:
+                            continue
+                
+                self._chunk_count = chunk_count
                 self._paper_count = len(paper_ids)
+                
         except Exception as e:
             logger.warning(f"Failed to update statistics: {e}")
             self._chunk_count = 0
@@ -787,11 +813,34 @@ class Layer2VectorStore:
                 logger.warning(f"Index file not found: {self.jsonl_file}")
                 return False
             
+            # 確保 document_store 已初始化
+            if self._document_store is None:
+                logger.warning("Document store not initialized, attempting to initialize...")
+                self._init_reranking_components()
+            
+            # 更新統計
             self._update_statistics()
             
-            logger.info("✓ Index loaded")
-            logger.info(f"  Chunks: {self._chunk_count}, Papers: {self._paper_count}")
-            return True
+            # 驗證載入成功
+            if self._chunk_count == 0:
+                logger.warning("Index file exists but contains no chunks")
+                # 嘗試直接計算檔案行數作為後備
+                try:
+                    with open(self.jsonl_file, 'r', encoding='utf-8') as f:
+                        line_count = sum(1 for _ in f)
+                    if line_count > 0:
+                        logger.info(f"  File contains {line_count} lines, re-initializing statistics...")
+                        self._update_statistics()
+                except Exception as count_error:
+                    logger.error(f"Failed to count lines: {count_error}")
+            
+            if self._chunk_count > 0:
+                logger.info("✓ Index loaded successfully")
+                logger.info(f"  Chunks: {self._chunk_count}, Papers: {self._paper_count}")
+                return True
+            else:
+                logger.warning("Failed to load index: no chunks found")
+                return False
             
         except Exception as e:
             logger.error(f"Failed to load index: {e}", exc_info=True)
@@ -826,6 +875,7 @@ class Layer2VectorStore:
         return {
             'chunk_count': self._chunk_count,
             'paper_count': self._paper_count,
+            'is_initialized': self.is_initialized,  # 添加 is_initialized 欄位
             'mode': 're-ranking',
             'document_store': self.jsonl_file,
             'reranker_model': self._reranker_config.get('model', 'qllama/bce-reranker-base_v1:latest')

@@ -347,9 +347,17 @@ class IndexManager:
         Returns:
             Backup ID (timestamp)
         """
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # 使用微秒級時間戳避免衝突
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         backup_id = f"backup_{timestamp}"
         backup_path = os.path.join(self.backup_dir, backup_id)
+        
+        # 確保目錄不存在（避免衝突）
+        counter = 0
+        original_backup_path = backup_path
+        while os.path.exists(backup_path):
+            counter += 1
+            backup_path = f"{original_backup_path}_{counter}"
         
         os.makedirs(backup_path, exist_ok=True)
         
