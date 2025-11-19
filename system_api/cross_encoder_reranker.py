@@ -1,8 +1,10 @@
 """
 Cross-Encoder Re-ranker Module
 
-Provides Cross-Encoder model for re-ranking (query, chunk) pairs.
-Uses Ollama's embedding API with bce-reranker model for accurate relevance scoring.
+Provides Cross-Encoder model for re-ranking (query, document) pairs.
+Uses Ollama's /api/generate endpoint with BCE-reranker model.
+Returns relevance scores in range [0, 1] where higher values indicate stronger relevance.
+Based on official dengcao/bce-reranker-base_v1 usage pattern.
 """
 
 import logging
@@ -16,12 +18,18 @@ logger = logging.getLogger(__name__)
 
 class CrossEncoderReranker:
     """
-    Cross-Encoder re-ranker using Ollama's bce-reranker model
+    Cross-Encoder re-ranker using Ollama's BCE-reranker model
     
-    Scores (query, chunk) pairs to capture semantic relationships
+    Scores (query, document) pairs to capture semantic relationships
     that Bi-Encoders cannot understand.
     
-    Uses Ollama API to interact with qllama/bce-reranker-base_v1 model.
+    Uses Ollama /api/generate endpoint with BCE Reranker prompt format:
+      "query: {query}\ndocument: {document}\nscore:"
+    
+    Returns relevance scores in range [0, 1]:
+      - 1.0: Perfectly relevant
+      - 0.5: Moderately relevant
+      - 0.0: Completely irrelevant
     """
     
     def __init__(
@@ -88,16 +96,17 @@ class CrossEncoderReranker:
     
     def _compute_similarity(self, query: str, chunk_text: str) -> float:
         """
-        Compute relevance score for (query, chunk) pair
+        Compute relevance score for (query, chunk) pair using BCE Reranker
         
-        Uses Ollama embeddings to score relevance.
+        Uses Ollama's /api/generate endpoint with BCE Reranker prompt format.
+        Based on official dengcao/bce-reranker-base_v1 usage pattern.
         
         Args:
             query: Query string
             chunk_text: Chunk text
             
         Returns:
-            Relevance score (0-1)
+            Relevance score (typically 0-1 range, higher = more relevant)
         """
         try:
             # Truncate if needed
@@ -106,45 +115,53 @@ class CrossEncoderReranker:
             if len(chunk_text) > self.max_length:
                 chunk_text = chunk_text[:self.max_length]
             
-            # Get query embedding
-            query_response = requests.post(
-                f"{self.ollama_base_url}/api/embeddings",
+            # 官方 BCE Reranker 格式
+            prompt = f"query: {query}\ndocument: {chunk_text}\nscore:"
+            
+            # 調用 Ollama generate API
+            response = requests.post(
+                f"{self.ollama_base_url}/api/generate",
                 json={
                     "model": self.model_name,
-                    "prompt": f"query: {query}"
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.0,  # 確保輸出穩定
+                        "num_predict": 10    # 只需要數字分數
+                    }
                 },
                 timeout=self.timeout
             )
             
-            # Get passage embedding
-            passage_response = requests.post(
-                f"{self.ollama_base_url}/api/embeddings",
-                json={
-                    "model": self.model_name,
-                    "prompt": f"passage: {chunk_text}"
-                },
-                timeout=self.timeout
-            )
-            
-            if query_response.status_code == 200 and passage_response.status_code == 200:
-                query_emb = np.array(query_response.json().get('embedding', []))
-                passage_emb = np.array(passage_response.json().get('embedding', []))
+            if response.status_code == 200:
+                result = response.json()
+                response_text = result.get('response', '').strip()
                 
-                if len(query_emb) > 0 and len(passage_emb) > 0:
-                    # Compute cosine similarity
-                    similarity = np.dot(query_emb, passage_emb) / (
-                        np.linalg.norm(query_emb) * np.linalg.norm(passage_emb)
-                    )
+                # 嘗試解析分數
+                # BCE Reranker 可能返回 "score: 0.95" 或 "0.95"
+                try:
+                    # 提取 ":" 後面的數字
+                    if ':' in response_text:
+                        score_str = response_text.split(':')[-1].strip()
+                    else:
+                        score_str = response_text
                     
-                    # Normalize to 0-1 range
-                    score = (similarity + 1) / 2  # Cosine similarity is in [-1, 1]
-                    return float(max(0.0, min(1.0, score)))
+                    # 提取第一個數字
+                    import re
+                    numbers = re.findall(r'\d+\.?\d*', score_str)
+                    if numbers:
+                        score = float(numbers[0])
+                        # BCE Reranker 通常輸出 0-1 範圍，但確保在有效範圍內
+                        score = max(0.0, min(1.0, score))
+                        return score
+                except (ValueError, IndexError):
+                    pass
             
-            return 0.5  # Neutral score on failure
+            return 0.0  # 失敗時返回最低分數
             
         except Exception as e:
             logger.debug(f"Error computing similarity: {e}")
-            return 0.5
+            return 0.0
     
     def score_pairs(
         self,
@@ -154,7 +171,7 @@ class CrossEncoderReranker:
         show_progress: bool = False
     ) -> List[float]:
         """
-        Score (query, chunk) pairs using Ollama
+        Score (query, chunk) pairs using BCE Reranker
         
         Args:
             query: Query string
@@ -163,7 +180,8 @@ class CrossEncoderReranker:
             show_progress: Not used (kept for API compatibility)
             
         Returns:
-            List of relevance scores (0-1)
+            List of relevance scores in range [0, 1]
+            Higher scores indicate stronger relevance
         """
         if not chunks:
             return []
@@ -171,7 +189,7 @@ class CrossEncoderReranker:
         # Check model availability
         if not self._check_model_available():
             logger.warning("Model unavailable, returning neutral scores")
-            return [0.5] * len(chunks)
+            return [0.0] * len(chunks)  # 中性分數（-1 到 1 範圍）
         
         try:
             logger.debug(f"Scoring {len(chunks)} chunks with Ollama re-ranker")
@@ -196,7 +214,7 @@ class CrossEncoderReranker:
             
         except Exception as e:
             logger.error(f"Failed to score pairs: {e}", exc_info=True)
-            return [0.5] * len(chunks)
+            return [0.0] * len(chunks)  # 中性分數（-1 到 1 範圍）
     
     def rank_chunks(
         self,

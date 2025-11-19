@@ -47,10 +47,10 @@ try:
             'layer1': {
                 'k_documents': int(os.getenv('LAYER1_K_DOCUMENTS', '10')),
                 'confidence_threshold': float(os.getenv('LAYER1_THRESHOLD', '0.6')),
-                'similarity_threshold': 0.48  # 降低閾值（純語義策略下需要更寬鬆）
+                'similarity_threshold': 0.49,  # 降低閾值（純語義策略下需要更寬鬆）
             },
             'layer2': {
-                'k_documents': int(os.getenv('LAYER2_K_DOCUMENTS', '2')),  # 限制為 2 個 chunks
+                'k_documents': int(os.getenv('LAYER2_K_DOCUMENTS', '3')),  # 限制為 3 個 chunks
                 'confidence_threshold': float(os.getenv('LAYER2_THRESHOLD', '0.6'))
             },
             'expansion': {

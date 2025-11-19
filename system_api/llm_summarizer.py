@@ -266,6 +266,114 @@ class LLMSummarizer:
             logger.warning(f"Failed to generate final summary: {e}")
             return " ".join(sub_summaries[:2])
     
+    def summarize_dataset_section(
+        self,
+        section_text: str,
+        section_name: str,
+        paper_context: Optional[str] = None
+    ) -> str:
+        """
+        專門為 Dataset 章節設計的摘要方法
+        
+        重點提取：
+        - 數據集名稱
+        - 樣本數量（訓練/測試/驗證）
+        - 數據來源
+        - 數據特徵（圖像大小、類別數等）
+        - 預處理步驟
+        - 訓練/測試分割比例
+        
+        Args:
+            section_text: Dataset 章節文本
+            section_name: 章節名稱
+            paper_context: 論文標題
+            
+        Returns:
+            Dataset 摘要字符串
+        """
+        if not section_text or len(section_text) < 50:
+            return section_text
+        
+        # 計算動態目標長度（Dataset 章節通常需要更多細節）
+        text_length = len(section_text)
+        dynamic_target_length = max(300, min(600, int(text_length * 0.3)))
+        
+        logger.info(f"Dataset section '{section_name}': {text_length} chars → target {dynamic_target_length} chars")
+        
+        # 使用專用 prompt
+        if text_length < self.map_reduce_threshold:
+            prompt = self._build_dataset_prompt(
+                section_text, 
+                section_name, 
+                paper_context,
+                target_length=dynamic_target_length
+            )
+            
+            # Try with retries
+            for attempt in range(self.max_retries):
+                try:
+                    summary = self.llm.invoke(prompt)
+                    if summary and len(summary.strip()) >= 100:
+                        return self._truncate(summary.strip(), int(dynamic_target_length * 1.1))
+                except Exception as e:
+                    logger.warning(f"Dataset summarization attempt {attempt+1} failed: {e}")
+                    if attempt < self.max_retries - 1:
+                        time.sleep(2 ** attempt)
+            
+            # Fallback
+            return self._extractive_summary(section_text, dynamic_target_length)
+        else:
+            # 對於超長 Dataset 章節使用 map-reduce
+            return self._summarize_map_reduce(
+                section_text,
+                section_name,
+                paper_context,
+                target_length=dynamic_target_length
+            )
+    
+    def _build_dataset_prompt(
+        self,
+        text: str,
+        section_name: str,
+        paper_context: Optional[str],
+        target_length: int = 400
+    ) -> str:
+        """
+        專門為 Dataset 章節設計的 prompt
+        
+        強調提取結構化數據集信息
+        """
+        context_line = f"\n**論文標題**：{paper_context}" if paper_context else ""
+        
+        return f"""你是一個專業的學術助理。請仔細閱讀以下論文的數據集章節，並生成一個結構化的摘要。
+
+**重要**：這是一個數據集相關章節，請務必提取以下關鍵信息（如果文中有提到）：
+
+1. **數據集名稱**：例如 MNIST、ImageNet、COCO、自定義數據集等
+2. **樣本數量**：
+   - 總樣本數
+   - 訓練集數量
+   - 測試集數量  
+   - 驗證集數量（如有）
+3. **數據來源**：公開數據集或自行收集？從哪裡獲得？
+4. **數據特徵**：圖像大小、類別數、數據格式等
+5. **數據預處理**：標準化、增強、裁剪、去噪等步驟
+6. **訓練/測試分割**：分割比例（如 80/20、70/30）
+
+**任務要求**：
+- 保留具體的數字（樣本數、圖像尺寸、分割比例）
+- 保留數據集的專有名稱
+- 使用清晰、結構化的語言
+- 省略不相關的圖表引用和參考文獻
+- 目標長度：約 {target_length} 字
+
+**章節類型**：{section_name}{context_line}
+
+**原文內容**：
+{text}
+
+**數據集摘要**："""
+    
     def _build_prompt(
         self,
         text: str,

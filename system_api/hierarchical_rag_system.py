@@ -718,8 +718,10 @@ class HierarchicalRAGSystem:
             
             result['timings']['layer1_retrieval'] = time.time() - layer1_start
             result['layers_used'].append('layer1')
-            result['layer1_docs'] = layer1_docs  # Save Layer 1 docs for reference display
-            result['layer1_scores'] = [score for doc, score in layer1_results_with_scores]  # Save scores for display
+            
+            # 保存 Layer1 文檔和分數
+            result['layer1_docs'] = layer1_docs
+            result['layer1_scores'] = [score for doc, score in layer1_results_with_scores]
             
             # 總是顯示前 5 名相似度最高的論文（從所有結果中）
             logger.info("\n📊 Layer 1 前 5 名相似度最高的論文:")
@@ -1046,7 +1048,18 @@ class HierarchicalRAGSystem:
 參考文獻內容：
 {context_text}
 
-請根據以上內容提供完整的答案。如果內容不足以回答問題，請明確說明。
+【回答指引】
+1. 仔細理解問題的重點關鍵詞（例如：資料集、方法、結果、貢獻等）
+2. 如果問題問的是「資料集」，請重點說明：
+   - 使用了什麼資料集？
+   - 資料集有多少樣本/數據？
+   - 資料來源是什麼？
+3. 如果問題問的是「方法」，請重點說明使用的技術和演算法
+4. 如果問題問的是「結果」，請重點說明實驗結果和性能指標
+5. 請針對問題的核心關鍵詞回答，不要泛泛而談
+6. 如果參考文獻中找不到相關資訊，請明確說明「論文中未提及相關資訊」
+
+請根據以上內容提供完整的答案。
 記住：回答必須使用繁體中文，例如「應用」而非「应用」，「資料」而非「数据」。
 
 回答："""
@@ -1058,7 +1071,18 @@ Question: {query}
 Contexts:
 {context_text}
 
-Please provide a comprehensive answer based on the contexts above. If the contexts don't contain enough information, acknowledge that.
+【Answer Guidelines】
+1. Carefully identify the key focus of the question (e.g., dataset, method, results, contribution)
+2. If the question asks about "dataset", focus on:
+   - What dataset(s) were used?
+   - How many samples/data points?
+   - What is the data source?
+3. If the question asks about "method", focus on the techniques and algorithms used
+4. If the question asks about "results", focus on experimental outcomes and performance metrics
+5. Answer directly to the core keyword of the question, don't provide general summaries
+6. If the information is not found in the contexts, clearly state "The paper does not mention this information"
+
+Please provide a comprehensive answer based on the contexts above.
 
 Answer:"""
         
@@ -1116,8 +1140,46 @@ Answer:"""
                 else:
                     referenced_papers.append(f"- {title}")
         
-        # Yield referenced papers first
-        if referenced_papers:
+        # ✨ 新增：檢索摘要（選項 C - 顯示所有候選論文）
+        if retrieval_result.get('layer1_ce_enabled', False):
+            # 有 Cross-Encoder 評分的情況
+            total_candidates = retrieval_result.get('layer1_ce_total_candidates', 0)
+            passed_count = retrieval_result.get('layer1_ce_passed', 0)
+            ce_scores = retrieval_result.get('layer1_ce_scores', [])
+            hybrid_scores = retrieval_result.get('layer1_hybrid_scores', [])
+            
+            if is_chinese_query:
+                yield "📊 檢索結果摘要\n"
+                yield "─" * 60 + "\n"
+                yield f"  階段 1 - 混合搜尋: {total_candidates} 篇候選\n"
+                yield f"  階段 2 - 精確評分: {passed_count} 篇通過閾值\n"
+                yield f"  最終選定: {len(layer1_docs)} 篇論文\n\n"
+                yield "🎯 候選論文列表:\n"
+            else:
+                yield "📊 Retrieval Summary\n"
+                yield "─" * 60 + "\n"
+                yield f"  Stage 1 - Hybrid Search: {total_candidates} candidates\n"
+                yield f"  Stage 2 - Precision Scoring: {passed_count} passed threshold\n"
+                yield f"  Final Selection: {len(layer1_docs)} papers\n\n"
+                yield "🎯 Candidate Papers:\n"
+            
+            # 顯示所有候選論文及雙重分數
+            for i, doc in enumerate(layer1_docs, 1):
+                title = doc.metadata.get('title', 'Unknown Title')
+                ce_score = ce_scores[i-1] if i-1 < len(ce_scores) else 0.0
+                hybrid_score = hybrid_scores[i-1] if i-1 < len(hybrid_scores) else 0.0
+                
+                if is_chinese_query:
+                    yield f"  {i}. {title}\n"
+                    yield f"     精確分數: {ce_score:.3f} | 混合分數: {hybrid_score:.3f}\n"
+                else:
+                    yield f"  {i}. {title}\n"
+                    yield f"     CE Score: {ce_score:.3f} | Hybrid Score: {hybrid_score:.3f}\n"
+            
+            yield "\n" + "="*60 + "\n\n"
+        
+        # Yield referenced papers first (原有格式)
+        elif referenced_papers:
             if is_chinese_query:
                 yield "📚 參考論文：\n"
             else:
@@ -1163,6 +1225,14 @@ Answer:"""
 論文相關段落：
 {context_text}
 
+【回答指引】
+1. 仔細理解問題的重點關鍵詞（例如：資料集、方法、結果、貢獻等）
+2. 如果問題問的是「資料集」，請重點說明：使用了什麼資料集、有多少樣本、資料來源
+3. 如果問題問的是「方法」，請重點說明使用的技術和演算法
+4. 如果問題問的是「結果」，請重點說明實驗結果和性能指標
+5. 請針對問題的核心關鍵詞回答，不要泛泛而談
+6. 如果段落中找不到相關資訊，請明確說明「論文中未提及」
+
 請根據以上段落，用繁體中文簡潔回答問題。"""
                 else:
                     prompt = f"""Based on the following research paper contexts, please answer the question.
@@ -1171,6 +1241,14 @@ Question: {query}
 
 Contexts:
 {context_text}
+
+【Answer Guidelines】
+1. Identify the key focus of the question (e.g., dataset, method, results)
+2. If asking about "dataset": specify what dataset, sample size, data source
+3. If asking about "method": specify techniques and algorithms
+4. If asking about "results": specify experimental outcomes and metrics
+5. Answer directly to the core keyword, don't provide general summaries
+6. If not found in contexts, state "Not mentioned in the paper"
 
 Please provide a concise answer based on the contexts above.
 
@@ -1206,6 +1284,14 @@ Answer:"""
 論文相關段落：
 {context_text}
 
+【回答指引】
+1. 仔細理解問題的重點關鍵詞（例如：資料集、方法、結果、貢獻等）
+2. 如果問題問的是「資料集」，請重點說明：使用了什麼資料集、有多少樣本、資料來源
+3. 如果問題問的是「方法」，請重點說明使用的技術和演算法
+4. 如果問題問的是「結果」，請重點說明實驗結果和性能指標
+5. 請針對問題的核心關鍵詞回答，不要泛泛而談
+6. 如果段落中找不到相關資訊，請明確說明「論文中未提及」
+
 請根據以上段落，用繁體中文完整回答問題。"""
             else:
                 prompt = f"""Based on the following research paper contexts, please answer the question.
@@ -1214,6 +1300,14 @@ Question: {query}
 
 Contexts:
 {context_text}
+
+【Answer Guidelines】
+1. Identify the key focus of the question (e.g., dataset, method, results)
+2. If asking about "dataset": specify what dataset, sample size, data source
+3. If asking about "method": specify techniques and algorithms
+4. If asking about "results": specify experimental outcomes and metrics
+5. Answer directly to the core keyword, don't provide general summaries
+6. If not found in contexts, state "Not mentioned in the paper"
 
 Please provide a comprehensive answer based on the contexts above.
 

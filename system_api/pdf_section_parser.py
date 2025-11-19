@@ -283,10 +283,11 @@ class PDFSectionParser:
                 # Chinese  
                 r'^第二章\s*文獻回顧',
                 r'^第二章\s+文獻回顧',
+                r'^第二章[、\s]*文獻',              # NEW: "第二章、文獻探討"（處理頓號）
                 r'^第二章\s*相關研究',
                 r'^相關研究',
                 r'^相關文獻',
-                r'^相關文獻回顧',
+                r'^相關文獻回顧',                   # NEW
                 r'^文獻探討',
                 r'^文獻回顧',
                 r'^二、?文獻',
@@ -302,14 +303,18 @@ class PDFSectionParser:
                 r'^[234]\.?\s*Method(s)?',
                 r'^Chapter\s+[234]\s+Method',
                 r'^Proposed Method',
+                r'^Proposed\s+',                    # NEW: "Proposed Methodology/Approach/System"
                 r'^Approach\s*$',
+                r'^System\s+Architecture',          # NEW: 系統架構
                 r'^III\.?\s+Method',
                 r'^IV\.?\s+Method',
                 # Chinese
-                r'^第[三四]章\s*研究方法',
-                r'^第[三四]章\s+研究方法',
+                r'^第[二三四]章\s*研究方法',
+                r'^第[二三四]章\s+研究方法',
+                r'^第[二三四]章\s*研究方法與',      # NEW: "第三章 研究方法與流程"
                 r'^第四章\s*研究方法',
                 r'^研究方法\s*$',
+                r'^\d+\.\s*研究設計',               # NEW: "3. 研究設計"
                 r'^方法論\s*$',
                 r'^方法\s*$',
                 r'^三、?方法',
@@ -321,20 +326,27 @@ class PDFSectionParser:
                 r'^RESULTS\s*$',
                 r'^[345]\.?\s*Results',
                 r'^Chapter\s+[345]\s+Results',
+                r'^Chapter\s+\d+\s*Experiment',     # NEW: "Chapter 5 Experimental Evaluation"
                 r'^Experiments\s*$',
                 r'^Experimental Results',
+                r'^Experimental\s+',                # NEW: "Experimental Evaluation/Analysis"
                 r'^Experiment\s*$',
                 r'^IV\.?\s+Results',
                 r'^V\.?\s+Results',
                 # Chinese
-                r'^第[四五]章\s*實驗',
-                r'^第[四五]章\s+實驗',
-                r'^第[四五]章\s*實驗模擬',
-                r'^第[四五]章\s+實驗模擬',
+                r'^第[四五六]章\s*實驗',
+                r'^第[四五六]章\s+實驗',
+                r'^第[四五六]章\s*實驗與結果',     # NEW: "第五章 實驗與結果分析"
+                r'^第[四五六]章\s*實驗模擬',
+                r'^第[四五六]章\s+實驗模擬',
                 r'^第四章\s*實驗模擬',
                 r'^第五章\s*實驗模擬',
                 r'^實驗結果',
+                r'^實驗與結果',                     # NEW: "實驗與結果分析"
                 r'^實驗模擬',
+                r'^\d+\.\d+\s+實驗評估',           # NEW: "5.1 實驗評估"
+                r'^\d+\.\s+實驗與',                # NEW: "5. 實驗與分析"
+                r'^結果與討論',                     # NEW
                 r'^結果\s*$',
                 r'^四、?實驗',
                 r'^五、?實驗',
@@ -377,6 +389,43 @@ class PDFSectionParser:
                 r'^五、?結論',
                 r'^六、?結論',
                 r'^七、?結論',
+            ],
+            'dataset': [
+                # === 根據真實論文分析（2025-11-19）===
+                # 分析了 35 篇論文，找到 21 篇有明確資料集章節（42 個章節）
+                # 主要模式：
+                # 1. "第X章 資料集" (16次) - 章節級別
+                # 2. "X.X 資料集" (23次) - 節級別
+                # 3. "X.X Dataset" (2次) - 英文節級別
+                
+                # === Chinese Chapter-level patterns (最常見，優先匹配) ===
+                r'^第[三四五]章\s*資料集',                    # 第三章 資料集
+                r'^第[三四五]章\s+資料集',                    # 第三章  資料集（多空格）
+                r'^第[三四五]章\s*資料集介紹',                # 第三章 資料集介紹
+                r'^第[三四五]章\s*資料集與',                  # 第三章 資料集與初步整理（鼻咽癌論文）
+                r'^第[三四五]章\s*数据集',                    # 簡體
+                
+                # === Chinese Section-level patterns (次常見) ===
+                r'^\d+\.\d+\s+資料集介紹',                    # 5.1 資料集介紹（最常見）
+                r'^\d+\.\d+\s+資料集與實驗',                  # 6.1 資料集與實驗參數介紹
+                r'^\d+\.\d+\s+資料集說明',                    # 4.1 資料集說明
+                r'^\d+\.\d+\s+資料集',                        # 5.1 資料集（通用）
+                r'^\d+\.\d+\s+目標資料集',                    # 3.1 目標資料集
+                r'^\d+\.\d+\s+数据集',                        # 簡體
+                
+                # === English Chapter-level patterns ===
+                r'^Chapter\s+[345]\s+Dataset',                # Chapter 3 Dataset
+                r'^Chapter\s+[345]:\s+Dataset',               # Chapter 3: Dataset
+                
+                # === English Section-level patterns ===
+                r'^\d+\.\d+\s+Dataset\s*$',                   # 4.1 Dataset
+                r'^\d+\.\d+\s+Dataset\s',                     # 4.1 Dataset Introduction
+                r'^\d+\.\d+\s+Data\s+Collection',            # 實際出現過
+                
+                # === Standalone titles (較不常見，但存在) ===
+                r'^Dataset\s*$',                              # Dataset
+                r'^資料集\s*$',                               # 資料集
+                r'^Data Collection\s*$',                      # 實際出現過
             ],
             'references': [
                 # English

@@ -373,14 +373,47 @@ class Layer2VectorStore:
                             logger.info(f"  [{section_idx}/{len(sections)}] Skipping {section.name} (filtered by Layer 1 logic)")
                             continue
                         
-                        logger.info(f"  [{section_idx}/{len(sections)}] Summarizing {section.name}...")
+                        # ✨ 檢測 Dataset 章節 - 基於真實分析結果（2025-11-19）
+                        # 分析 35 篇論文，發現 Dataset 章節的命名模式：
+                        # - "第三章 資料集" / "第三章 資料集與初步整理" (中文章節)
+                        # - "5.1 資料集介紹" / "6.1 資料集與實驗參數介紹" (中文小節)
+                        # - "Chapter 3 Dataset" / "4.1 Dataset" (英文)
+                        is_dataset_section = (
+                            '資料集' in section_name_lower or              # 最常見：中文「資料集」
+                            '数据集' in section_name_lower or              # 簡體
+                            'dataset' in section_name_lower or             # 英文 dataset
+                            'data collection' in section_name_lower or     # 英文 data collection
+                            ('data' in section_name_lower and              # 避免誤判：只有當 data 獨立出現時
+                             (section_name_lower.strip() == 'data' or      # 單獨 "Data"
+                              section_name_lower.startswith('data ') or    # "Data Introduction"
+                              section_name_lower.endswith(' data')))       # "Training Data"
+                        )
+                        
+                        if is_dataset_section:
+                            logger.info(f"  [{section_idx}/{len(sections)}] 🔍 Dataset section detected: {section.name}")
+                        else:
+                            logger.info(f"  [{section_idx}/{len(sections)}] Summarizing {section.name}...")
                         
                         try:
-                            summary = self.summarizer.summarize_section(
-                                section.text,
-                                section.name,
-                                paper_context=paper_title
-                            )
+                            # 根據章節類型選擇不同的摘要策略
+                            if is_dataset_section:
+                                # Dataset 專用 prompt：強調提取數據集關鍵信息
+                                summary = self.summarizer.summarize_dataset_section(
+                                    section.text,
+                                    section.name,
+                                    paper_context=paper_title
+                                )
+                                chunk_type = 'dataset_chunk'
+                                logger.info(f"  ✓ Dataset summary: {len(section.text)} → {len(summary)} chars")
+                            else:
+                                # 一般章節使用標準摘要
+                                summary = self.summarizer.summarize_section(
+                                    section.text,
+                                    section.name,
+                                    paper_context=paper_title
+                                )
+                                chunk_type = 'section_summary'
+                                logger.info(f"  ✓ Summary: {len(section.text)} → {len(summary)} chars")
                             
                             # Create Document with enhanced metadata
                             chunk_doc = Document(
@@ -388,7 +421,7 @@ class Layer2VectorStore:
                                 metadata={
                                     'paper_id': paper_id,
                                     'chunk_id': f"{paper_id}_{section.name.lower().replace(' ', '_')}",
-                                    'chunk_type': 'section_summary',
+                                    'chunk_type': chunk_type,  # ✨ 區分 dataset_chunk 和 section_summary
                                     'section_name': section.name,
                                     'original_length': section.char_count,
                                     'summary_length': len(summary),
@@ -399,7 +432,7 @@ class Layer2VectorStore:
                                 }
                             )
                             summarized_chunks.append(chunk_doc)
-                            logger.info(f"  ✓ Summary: {len(section.text)} → {len(summary)} chars")
+                            
                             
                         except Exception as e:
                             logger.error(f"  Failed to summarize {section.name}: {e}")

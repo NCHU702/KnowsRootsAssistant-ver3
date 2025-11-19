@@ -98,14 +98,20 @@ class Layer2TriggerDecision:
                 }
         
         # ===== 優先級 2：詳細內容需求 → 必須進 Layer 2 =====
-        # 情況 B：詳細解釋、方法論、實作細節 → 必須進入 Layer 2
-        if query_analysis['type'] in ['detailed_explanation', 'methodology', 'implementation']:
+        # 情況 B：詳細解釋、方法論、實作細節、具體數據查詢 → 必須進入 Layer 2
+        if query_analysis['type'] in ['detailed_explanation', 'methodology', 'implementation', 'detail_inquiry']:
             if len(layer1_docs) > 0:  # 只要 Layer 1 有結果
+                reason_map = {
+                    'detail_inquiry': '查詢涉及具體細節（如資料集、參數、實驗設置），摘要層通常不包含此類資訊',
+                    'methodology': '查詢需要詳細方法論',
+                    'implementation': '查詢需要實作細節',
+                    'detailed_explanation': '查詢需要詳細解釋'
+                }
                 return {
                     'should_trigger': True,
                     'reason': (
-                        f"查詢類型 '{query_analysis['type']}' 需要詳細內容或方法論，"
-                        f"必須進入 Layer 2 獲取具體資訊（當前信心度: {confidence:.2f}）"
+                        f"{reason_map.get(query_analysis['type'], '查詢需要詳細內容')}，"
+                        f"必須進入 Layer 2 獲取論文內文（當前信心度: {confidence:.2f}）"
                     ),
                     'adjusted_threshold': adjusted_threshold,
                     'decision_factors': factors
@@ -223,6 +229,20 @@ class Layer2TriggerDecision:
         
         # 簡單規則式判斷
         # 未來可以升級為 LLM 判斷（如果有 self.llm）
+        
+        # ===== 優先級 0：細節查詢（資料集、數據、參數等）→ 必須進 Layer 2 =====
+        # 這些問題需要論文中的具體細節，摘要通常不包含
+        detail_keywords = [
+            '資料集', '数据集', 'dataset', '數據', '数据', 'data',
+            '參數', '参数', 'parameter', 'hyperparameter',
+            '實驗設置', '实验设置', 'experimental setup',
+            '評估指標', '评估指标', 'evaluation metric',
+            '模型架構', '模型架构', 'model architecture',
+            '訓練細節', '训练细节', 'training detail',
+            '具體', '详细', 'specific', 'detail'
+        ]
+        if any(kw in query_lower for kw in detail_keywords):
+            return {'type': 'detail_inquiry', 'complexity': 'complex'}
         
         # ===== 優先級 1：方法論關鍵詞（如何、怎麼）→ 必須優先檢查 =====
         # 「如何應用」、「如何實現」等明確要求方法的查詢
