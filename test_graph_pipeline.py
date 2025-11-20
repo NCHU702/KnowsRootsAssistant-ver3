@@ -121,6 +121,8 @@ def run_batch_test():
             print(f"    -> Goal: {extracted_data.get('research_goal')[:50]}...")
             print(f"    -> Methods ({len(extracted_data.get('methods', []))}): {extracted_data.get('methods')}")
             print(f"    -> Datasets ({len(extracted_data.get('datasets', []))}): {extracted_data.get('datasets')}")
+            print(f"    -> Domain: {extracted_data.get('domain')}")
+            print(f"    -> Metrics: {extracted_data.get('metrics')}")
 
             # Step C: Neo4j Ingestion
             paper_id = pdf_file.stem.replace(" ", "_") # 簡單的 ID 生成
@@ -131,10 +133,12 @@ def run_batch_test():
             success = graph_manager.add_paper_metadata(
                 paper_id=paper_id,
                 title=paper_title,
-                year="2024", # 模擬數據
+                year="2024",
                 research_goal=extracted_data.get('research_goal', ''),
                 methods=extracted_data.get('methods', []),
-                datasets=extracted_data.get('datasets', [])
+                datasets=extracted_data.get('datasets', []),
+                domain=extracted_data.get('domain', ''),       # [新增]
+                metrics=extracted_data.get('metrics', [])      # [新增]
             )
             step_times['db_write'] = time.time() - t0
 
