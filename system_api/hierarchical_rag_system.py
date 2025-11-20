@@ -413,6 +413,59 @@ class HierarchicalRAGSystem:
         else:
             logger.warning("⚠️  No chunks created, skipping Layer 2")
         
+        # Step: Optional Graph Indexing (after both layers built)
+        if self.index_manager.graph_manager and self.index_manager.graph_extractor:
+            logger.info("\n" + "="*80)
+            logger.info("Graph RAG Indexing (Optional)")
+            logger.info("="*80)
+            
+            graph_success = 0
+            graph_errors = 0
+            
+            for i, pdf_path in enumerate(pdf_paths, 1):
+                try:
+                    filename = os.path.basename(pdf_path)
+                    logger.info(f"[{i}/{len(pdf_paths)}] Indexing to Graph: {filename}")
+                    
+                    # Read PDF text again (needed for graph extraction)
+                    from PyPDF2 import PdfReader
+                    reader = PdfReader(pdf_path)
+                    pdf_text = ""
+                    for page in reader.pages[:10]:  # First 10 pages sufficient
+                        pdf_text += page.extract_text() + "\n"
+                    
+                    # Extract graph metadata
+                    graph_data = self.index_manager.graph_extractor.extract(pdf_text)
+                    
+                    # Get paper_id (same as used in build)
+                    paper_id = os.path.splitext(filename)[0]
+                    
+                    # Write to Neo4j
+                    success = self.index_manager.graph_manager.add_paper_metadata(
+                        paper_id=paper_id,
+                        title=paper_id,  # Use filename as title
+                        year='Unknown',
+                        research_goal=graph_data.get('research_goal', ''),
+                        methods=graph_data.get('methods', []),
+                        datasets=graph_data.get('datasets', []),
+                        domain=graph_data.get('domain', 'Unknown'),
+                        domain_zh=graph_data.get('domain_zh', '未知領域'),
+                        metrics=graph_data.get('metrics', [])
+                    )
+                    
+                    if success:
+                        logger.info(f"  ✓ Graph metadata indexed")
+                        graph_success += 1
+                    else:
+                        logger.warning(f"  ✗ Graph indexing failed")
+                        graph_errors += 1
+                        
+                except Exception as e:
+                    logger.error(f"  ✗ Graph indexing error: {e}")
+                    graph_errors += 1
+            
+            logger.info(f"Graph Indexing Complete: {graph_success} success, {graph_errors} errors")
+        
         # Summary
         duration = time.time() - start_time
         stats = self.get_stats()
@@ -473,13 +526,12 @@ class HierarchicalRAGSystem:
             pages = loader.load()
             pdf_text = "\n".join([page.page_content for page in pages])
             
-            # Generate paper ID
-            import hashlib
-            paper_id = hashlib.md5(pdf_path.encode()).hexdigest()[:16]
+            # Generate paper ID (use filename without extension for consistency with build_indices)
+            paper_id = os.path.splitext(os.path.basename(pdf_path))[0]
             
             # Extract metadata
             paper_metadata = {
-                'title': os.path.basename(pdf_path).replace('.pdf', ''),
+                'title': paper_id,
                 'pdf_path': pdf_path,
                 'source_file': os.path.basename(pdf_path)
             }
@@ -1345,22 +1397,24 @@ Answer:"""
     
     def check_and_update_indices(self, force_rebuild: bool = False) -> Dict[str, Any]:
         """
-        智能檢查索引狀態並更新（支援增量更新）
+        智能檢查索引狀態並更新（三資料庫同步邏輯）
         
-        檢查項目：
-        1. 索引是否存在
-        2. 索引是否損壞
-        3. 是否有新增的 PDF（增量更新）
-        4. 是否有刪除的 PDF（需重建）
+        以 pdf_directory 為真相來源，確保 Layer1、Layer2、GraphRAG 三個資料庫一致：
+        1. 索引是否存在且健康
+        2. 掃描 pdf_directory 中所有 PDF（真相）
+        3. 掃描 Vector DB (Layer1) 中已索引的論文
+        4. 掃描 Graph DB 中已索引的論文
+        5. 刪除多餘的索引（Vector + Graph）
+        6. 新增缺少的索引（Vector + Graph）
         
         Args:
-            force_rebuild: 強制重建索引
+            force_rebuild: 強制重建所有索引
             
         Returns:
             操作結果字典
         """
         logger.info("="*80)
-        logger.info("Checking Index Status")
+        logger.info("Checking Index Status (3-Database Sync)")
         logger.info("="*80)
         
         result = {
@@ -1369,7 +1423,7 @@ Answer:"""
             'details': {}
         }
         
-        # 檢查 1: 索引是否就緒
+        # 檢查 1: 索引是否就緒或強制重建
         if not self.is_ready() or force_rebuild:
             if force_rebuild:
                 logger.info("Force rebuild requested")
@@ -1383,154 +1437,226 @@ Answer:"""
             result['details'] = build_result
             return result
         
-        # 檢查 2: 獲取當前狀態
+        # 檢查 2: 獲取三個資料庫的狀態
         try:
-            stats1 = self.layer1.get_stats()
-            stats2 = self.layer2.get_stats()
-            current_pdfs = set(self._get_all_pdfs())
+            # Step 2.1: 獲取 pdf_directory 中所有 PDF（真相來源）
+            current_pdf_paths = set(self._get_all_pdfs())
+            current_paper_ids = set()
+            pdf_path_to_id = {}  # 用於後續查找
             
-            indexed_count = stats1.get('paper_count', 0)
-            current_count = len(current_pdfs)
+            for pdf_path in current_pdf_paths:
+                # paper_id = filename without extension
+                paper_id = os.path.splitext(os.path.basename(pdf_path))[0]
+                current_paper_ids.add(paper_id)
+                pdf_path_to_id[paper_id] = pdf_path
             
-            logger.info(f"Current PDF files: {current_count}")
-            logger.info(f"Indexed papers: {indexed_count}")
+            logger.info(f"📁 PDF Directory: {len(current_paper_ids)} papers")
             
-            # 檢查 3: 獲取已索引的 PDF 路徑
-            if current_count != indexed_count:
-                logger.warning(f"PDF count mismatch! Current: {current_count}, Indexed: {indexed_count}")
-                
-                # 從 Layer 1 vectorstore 獲取已索引的 PDF 路徑
-                indexed_pdfs = set()
-                if self.layer1.vectorstore:
-                    try:
-                        # FAISS vectorstore 的正確訪問方式
-                        docstore = self.layer1.vectorstore.docstore
-                        if hasattr(docstore, '_dict'):
-                            all_docs = list(docstore._dict.values())
-                        elif hasattr(docstore, 'search'):
-                            # 如果沒有 _dict，嘗試獲取所有文檔
-                            all_docs = []
-                            for idx in range(indexed_count):
-                                try:
-                                    doc = docstore.search(str(idx))
-                                    if doc:
-                                        all_docs.append(doc)
-                                except:
-                                    continue
-                        else:
-                            logger.warning("Cannot access docstore, will rebuild index")
-                            all_docs = []
-                        
-                        for doc in all_docs:
-                            pdf_path = doc.metadata.get('pdf_path', '')
-                            if pdf_path:
-                                indexed_pdfs.add(pdf_path)
-                    except Exception as e:
-                        logger.error(f"Error reading indexed PDFs: {e}")
-                
-                logger.info(f"Indexed PDF paths: {len(indexed_pdfs)}")
-                
-                # 檢查 4: 找出新增和刪除的 PDF
-                new_pdfs = current_pdfs - indexed_pdfs
-                removed_pdfs = indexed_pdfs - current_pdfs
-                
-                if removed_pdfs:
-                    logger.warning(f"Detected {len(removed_pdfs)} removed PDF(s):")
-                    for pdf in list(removed_pdfs)[:5]:  # 只顯示前 5 個
-                        logger.warning(f"  - {os.path.basename(pdf)}")
-                    logger.warning("Rebuild required due to removed PDFs")
-                    result['action_taken'] = 'rebuild'
+            # Step 2.2: 獲取 Vector DB (Layer1) 中已索引的 paper_id
+            indexed_in_vector = set()
+            if self.layer1.vectorstore:
+                try:
+                    docstore = self.layer1.vectorstore.docstore
+                    if hasattr(docstore, '_dict'):
+                        all_docs = list(docstore._dict.values())
+                    else:
+                        all_docs = []
                     
-                    build_result = self.build_indices()
-                    result['status'] = build_result.get('status', 'error')
-                    result['details'] = build_result
-                    result['details']['removed_pdfs'] = len(removed_pdfs)
-                    return result
-                
-                if new_pdfs:
-                    logger.info(f"✓ Detected {len(new_pdfs)} new PDF(s) - using incremental update")
-                    for pdf in list(new_pdfs)[:5]:  # 只顯示前 5 個
-                        logger.info(f"  + {os.path.basename(pdf)}")
-                    if len(new_pdfs) > 5:
-                        logger.info(f"  ... and {len(new_pdfs) - 5} more")
-                    
-                    result['action_taken'] = 'incremental_update'
-                    
-                    # 增量更新：只處理新增的 PDF
-                    added_count = 0
-                    failed_count = 0
-                    start_time = time.time()
-                    
-                    for i, pdf_path in enumerate(sorted(new_pdfs), 1):
-                        try:
-                            logger.info(f"[{i}/{len(new_pdfs)}] Adding: {os.path.basename(pdf_path)}")
-                            add_result = self.add_document(pdf_path)
-                            if add_result['status'] == 'success':
-                                added_count += 1
-                            else:
-                                failed_count += 1
-                                logger.warning(f"  ✗ Failed: {add_result.get('error', 'Unknown error')}")
-                        except Exception as e:
-                            failed_count += 1
-                            logger.error(f"  ✗ Error adding {os.path.basename(pdf_path)}: {e}")
-                    
-                    duration = time.time() - start_time
-                    
-                    # 更新統計
-                    stats1 = self.layer1.get_stats()
-                    stats2 = self.layer2.get_stats()
-                    
-                    result['status'] = 'success'
-                    result['details'] = {
-                        'new_pdfs_detected': len(new_pdfs),
-                        'successfully_added': added_count,
-                        'failed': failed_count,
-                        'duration': duration,
-                        'layer1': stats1,
-                        'layer2': stats2
-                    }
-                    
-                    logger.info("="*80)
-                    logger.info("Incremental Update Complete")
-                    logger.info(f"  Duration: {duration:.1f}s")
-                    logger.info(f"  Added: {added_count}/{len(new_pdfs)} PDFs")
-                    if failed_count > 0:
-                        logger.warning(f"  Failed: {failed_count} PDFs")
-                    logger.info(f"  Total Papers: {stats1['paper_count']}")
-                    logger.info(f"  Total Chunks: {stats2['chunk_count']}")
-                    logger.info("="*80)
-                    
-                    return result
+                    for doc in all_docs:
+                        paper_id = doc.metadata.get('paper_id', '')
+                        if paper_id:
+                            indexed_in_vector.add(paper_id)
+                except Exception as e:
+                    logger.error(f"Error reading Vector DB: {e}")
             
-            # 檢查 5: 驗證索引完整性
-            if not stats1.get('is_initialized') or not stats2.get('is_initialized'):
-                logger.error("Indices appear corrupted")
-                result['status'] = 'corrupted'
-                result['action_taken'] = 'rebuild'
+            logger.info(f"📊 Vector DB (Layer1): {len(indexed_in_vector)} papers")
+            
+            # Step 2.3: 獲取 Graph DB 中已索引的 paper_id
+            indexed_in_graph = set()
+            if self.index_manager.graph_manager:
+                try:
+                    indexed_in_graph = set(self.index_manager.graph_manager.get_all_paper_ids())
+                except Exception as e:
+                    logger.error(f"Error reading Graph DB: {e}")
+            
+            logger.info(f"🕸️  Graph DB: {len(indexed_in_graph)} papers")
+            
+            # Step 2.4: 計算差異
+            # 多餘的論文（需要刪除）
+            extra_in_vector = indexed_in_vector - current_paper_ids
+            extra_in_graph = indexed_in_graph - current_paper_ids
+            
+            # 缺少的論文（需要新增）
+            missing_in_vector = current_paper_ids - indexed_in_vector
+            missing_in_graph = current_paper_ids - indexed_in_graph
+            
+            logger.info("")
+            logger.info("📈 Synchronization Status:")
+            logger.info(f"  ➕ New papers to add: {len(missing_in_vector)}")
+            logger.info(f"  ➖ Extra papers to remove from Vector DB: {len(extra_in_vector)}")
+            logger.info(f"  ➖ Extra papers to remove from Graph DB: {len(extra_in_graph)}")
+            
+            # 檢查 3: 處理刪除（如果有多餘的論文）
+            has_deletions = len(extra_in_vector) > 0 or len(extra_in_graph) > 0
+            has_additions = len(missing_in_vector) > 0
+            
+            if has_deletions:
+                logger.warning("⚠️  Detected extra papers in databases! Need to rebuild Vector DB to remove them.")
+                logger.warning(f"  Extra in Vector DB: {list(extra_in_vector)[:5]}")
+                if len(extra_in_vector) > 5:
+                    logger.warning(f"  ... and {len(extra_in_vector) - 5} more")
+                
+                # Vector DB: FAISS 不支持單獨刪除，需要重建
+                logger.info("Rebuilding Vector DB (Layer1 + Layer2) to remove extra papers...")
+                result['action_taken'] = 'rebuild_due_to_deletions'
                 
                 build_result = self.build_indices()
                 result['status'] = build_result.get('status', 'error')
                 result['details'] = build_result
+                result['details']['removed_from_vector'] = len(extra_in_vector)
+                
+                # Graph DB: 可以單獨刪除
+                if len(extra_in_graph) > 0 and self.index_manager.graph_manager:
+                    logger.info(f"Removing {len(extra_in_graph)} extra papers from Graph DB...")
+                    removed_count = 0
+                    for paper_id in extra_in_graph:
+                        success = self.index_manager.graph_manager.delete_paper(paper_id)
+                        if success:
+                            removed_count += 1
+                    logger.info(f"✓ Removed {removed_count}/{len(extra_in_graph)} papers from Graph DB")
+                    result['details']['removed_from_graph'] = removed_count
+                
                 return result
             
-            # 全部檢查通過
-            logger.info("✓ Indices are up-to-date and healthy")
+            # 檢查 4: 處理新增（只有新增的論文）
+            if has_additions:
+                logger.info(f"✓ Detected {len(missing_in_vector)} new PDF(s) - using incremental update")
+                
+                # 顯示要新增的論文
+                for paper_id in list(missing_in_vector)[:5]:
+                    logger.info(f"  + {paper_id}")
+                if len(missing_in_vector) > 5:
+                    logger.info(f"  ... and {len(missing_in_vector) - 5} more")
+                
+                result['action_taken'] = 'incremental_update'
+                
+                # 增量更新：處理新增的 PDF
+                added_to_vector = 0
+                added_to_graph = 0
+                failed_count = 0
+                start_time = time.time()
+                
+                for i, paper_id in enumerate(sorted(missing_in_vector), 1):
+                    try:
+                        pdf_path = pdf_path_to_id.get(paper_id)
+                        if not pdf_path:
+                            logger.warning(f"  Cannot find PDF path for {paper_id}")
+                            failed_count += 1
+                            continue
+                        
+                        logger.info(f"[{i}/{len(missing_in_vector)}] Adding: {os.path.basename(pdf_path)}")
+                        
+                        # 新增到 Vector DB (自動包含 Layer1 + Layer2)
+                        add_result = self.add_document(pdf_path)
+                        if add_result['status'] == 'success':
+                            added_to_vector += 1
+                            logger.info(f"  ✓ Added to Vector DB")
+                        else:
+                            failed_count += 1
+                            logger.warning(f"  ✗ Failed to add to Vector DB: {add_result.get('error', 'Unknown')}")
+                            continue
+                        
+                        # 新增到 Graph DB (如果配置了 graph_manager)
+                        if self.index_manager.graph_manager and self.index_manager.graph_extractor:
+                            try:
+                                # 提取 PDF 文本
+                                from langchain_community.document_loaders import PyMuPDFLoader
+                                loader = PyMuPDFLoader(pdf_path)
+                                pages = loader.load()
+                                pdf_text = "\n".join([page.page_content for page in pages])
+                                
+                                # 提取結構化數據
+                                graph_data = self.index_manager.graph_extractor.extract(pdf_text)
+                                
+                                # 寫入 Neo4j
+                                success = self.index_manager.graph_manager.add_paper_metadata(
+                                    paper_id=paper_id,
+                                    title=os.path.basename(pdf_path),
+                                    year=graph_data.get('year', 'Unknown'),
+                                    research_goal=graph_data.get('research_goal', ''),
+                                    methods=graph_data.get('methods', []),
+                                    datasets=graph_data.get('datasets', []),
+                                    domain=graph_data.get('domain', 'Unknown'),
+                                    metrics=graph_data.get('metrics', []),
+                                    domain_zh=graph_data.get('domain_zh', '未知領域')
+                                )
+                                
+                                if success:
+                                    added_to_graph += 1
+                                    logger.info(f"  ✓ Added to Graph DB")
+                                else:
+                                    logger.warning(f"  ⚠️ Failed to add to Graph DB")
+                            except Exception as e:
+                                logger.error(f"  ✗ Error adding to Graph DB: {e}")
+                        
+                    except Exception as e:
+                        failed_count += 1
+                        logger.error(f"  ✗ Error processing {paper_id}: {e}")
+                
+                duration = time.time() - start_time
+                
+                # 更新統計
+                stats1 = self.layer1.get_stats()
+                stats2 = self.layer2.get_stats()
+                
+                result['status'] = 'success'
+                result['details'] = {
+                    'new_papers_detected': len(missing_in_vector),
+                    'added_to_vector': added_to_vector,
+                    'added_to_graph': added_to_graph,
+                    'failed': failed_count,
+                    'duration': duration,
+                    'layer1': stats1,
+                    'layer2': stats2
+                }
+                
+                logger.info("="*80)
+                logger.info("Incremental Update Complete")
+                logger.info(f"  Duration: {duration:.1f}s")
+                logger.info(f"  Added to Vector DB: {added_to_vector}/{len(missing_in_vector)}")
+                logger.info(f"  Added to Graph DB: {added_to_graph}/{len(missing_in_vector)}")
+                if failed_count > 0:
+                    logger.warning(f"  Failed: {failed_count}")
+                logger.info(f"  Total Papers (Vector): {stats1['paper_count']}")
+                logger.info(f"  Total Chunks (Vector): {stats2['chunk_count']}")
+                logger.info("="*80)
+                
+                return result
+            
+            # 檢查 5: 全部檢查通過，所有資料庫已同步
+            logger.info("✓ All databases are in sync and up-to-date")
+            stats1 = self.layer1.get_stats()
+            stats2 = self.layer2.get_stats()
+            
             result['details'] = {
                 'layer1': stats1,
                 'layer2': stats2,
-                'pdf_count': current_count
+                'pdf_count': len(current_paper_ids),
+                'vector_count': len(indexed_in_vector),
+                'graph_count': len(indexed_in_graph)
             }
             
         except Exception as e:
-            logger.error(f"Error checking indices: {e}")
+            logger.error(f"Error checking indices: {e}", exc_info=True)
             result['status'] = 'error'
             result['details']['error'] = str(e)
             
             # 嘗試重建
-            logger.info("Attempting to rebuild indices...")
-            result['action_taken'] = 'rebuild'
+            logger.info("Attempting to rebuild indices due to error...")
+            result['action_taken'] = 'rebuild_due_to_error'
             build_result = self.build_indices()
             result['status'] = build_result.get('status', 'error')
             result['details']['rebuild'] = build_result
         
         return result
+

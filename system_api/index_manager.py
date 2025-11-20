@@ -56,13 +56,26 @@ class IndexManager:
         self.text_preprocessor = TextPreprocessor()
         self.backup_dir = backup_dir
         self.max_backups = max_backups
-        
+        # Optional Graph components (can be attached later)
+        self.graph_manager: Optional[Any] = None
+        self.graph_extractor: Optional[Any] = None
+
         # Ensure backup directory exists
         os.makedirs(backup_dir, exist_ok=True)
         
         logger.info(f"Index Manager initialized")
         logger.info(f"  Backup directory: {backup_dir}")
         logger.info(f"  Max backups: {max_backups}")
+
+    def set_graph_components(self, graph_manager: Optional[Any], graph_extractor: Optional[Any]):
+        """Attach GraphManager and GraphDataExtractor for optional graph ingestion.
+
+        These components are optional and may be set after IndexManager initialization
+        (e.g., when the global graph manager is initialized later by the application).
+        """
+        self.graph_manager = graph_manager
+        self.graph_extractor = graph_extractor
+        logger.info("✓ Graph components attached to IndexManager")
     
     def add_document(
         self,
@@ -165,6 +178,40 @@ class IndexManager:
             
             # Clean up old backups
             self._rotate_backups()
+
+            # Step 7: Optional Graph ingestion (do not fail the index operation)
+            try:
+                if self.graph_manager and self.graph_extractor:
+                    logger.info("Step 7: Indexing metadata to Graph DB (optional)...")
+                    try:
+                        extract_result = self.graph_extractor.extract(pdf_text)
+                    except Exception as e:
+                        logger.warning(f"Graph extractor failed: {e}")
+                        extract_result = {}
+
+                    try:
+                        # Compose arguments with safe defaults
+                        gm_args = {
+                            'paper_id': paper_id,
+                            'title': abstract_result.get('title') if isinstance(abstract_result, dict) else paper_metadata.get('title'),
+                            'year': paper_metadata.get('year') if paper_metadata else None,
+                            'research_goal': extract_result.get('research_goal') if extract_result else None,
+                            'methods': extract_result.get('methods') if extract_result else [],
+                            'datasets': extract_result.get('datasets') if extract_result else [],
+                            'domain': extract_result.get('domain') if extract_result else None,
+                            'domain_zh': extract_result.get('domain_zh') if extract_result else None,
+                            'metrics': extract_result.get('metrics') if extract_result else []
+                        }
+
+                        # Call GraphManager (may raise, but we catch below)
+                        self.graph_manager.add_paper_metadata(**gm_args)
+                        logger.info(f"  ✓ Graph metadata indexed for paper: {paper_id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to write graph metadata for {paper_id}: {e}")
+
+            except Exception:
+                # Defensive: ensure no exception here can break the main flow
+                logger.exception("Unexpected error during optional Graph ingestion")
             
             duration = time.time() - start_time
             

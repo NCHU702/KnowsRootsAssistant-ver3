@@ -20,6 +20,8 @@ from system_api.paper_extractor import PaperExtractor
 from system_api.database_updater import DatabaseUpdater
 from system_api.pdf_storage import PDFStorage
 from system_api.hierarchical_rag_system import HierarchicalRAGSystem
+from system_api.graph_manager import GraphManager
+from system_api.graph_extractor import GraphDataExtractor
 from collections import Counter
 model_name = "jcai/llama-3-taiwan-8b-instruct:q4_k_m"
 
@@ -28,6 +30,21 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+# Initialize Ollama LLM for agent (Moved up for Graph RAG dependency)
+agent_llm = None
+try:
+    agent_llm = OllamaLLM(
+        model=model_name, # agent model
+        temperature=0,
+        base_url="http://localhost:11434"
+    )
+    # Test the connection
+    test_response = agent_llm.invoke("Hello")
+    logger.info("Agent Ollama connection successful")
+except Exception as e:
+    logger.error(f"Failed to connect to Ollama for agent: {e}")
+    logger.warning("Agent will use fallback routing")
 
 # ============================================================================
 # Hierarchical RAG System Configuration
@@ -108,25 +125,57 @@ try:
     if chunking_mode == 'summarization':
         logger.info(f"  Summarization Model: {os.getenv('SUMMARIZATION_MODEL', 'llama3:8b')}")
         logger.info(f"  Target Summary Length: {os.getenv('TARGET_SUMMARY_LENGTH', '300')} chars")
-    
-    # 智能檢查並更新索引
-    logger.info("Checking index status...")
-    check_result = rag_system.check_and_update_indices()
-    
-    if check_result['status'] == 'success':
-        if check_result['action_taken']:
-            logger.info(f"✓ Action taken: {check_result['action_taken']}")
-            logger.info(f"✓ Processed {check_result['details'].get('papers_processed', 0)} papers")
-        else:
-            logger.info("✓ Indices are up-to-date")
-    elif check_result['status'] == 'up_to_date':
-        logger.info("✓ Indices are healthy and up-to-date")
-    else:
-        logger.error(f"✗ Index check/update failed: {check_result.get('details', {}).get('error', 'Unknown error')}")
         
 except Exception as e:
     logger.error(f"Failed to initialize Hierarchical RAG System: {e}", exc_info=True)
     rag_system = None
+
+# Initialize Graph RAG Components (Moved up to attach before index check)
+logger.info("Initializing Graph RAG components...")
+graph_manager = None
+graph_extractor = None
+
+try:
+    # Reuse the existing 'agent_llm'
+    if agent_llm:
+        graph_manager = GraphManager(llm=agent_llm)
+        graph_extractor = GraphDataExtractor(llm=agent_llm)
+        logger.info("✓ Graph RAG components initialized successfully")
+        # Attach graph components to IndexManager if available so incremental adds also index to Graph
+        try:
+            if rag_system and hasattr(rag_system, 'index_manager') and graph_manager:
+                rag_system.index_manager.set_graph_components(graph_manager, graph_extractor)
+                logger.info("✓ Graph components attached to rag_system.index_manager")
+        except Exception as e:
+            logger.warning(f"Could not attach graph components to IndexManager: {e}")
+    else:
+        logger.warning("Agent LLM not available, skipping Graph RAG initialization")
+except Exception as e:
+    logger.error(f"✗ Failed to initialize Graph RAG components: {e}")
+    logger.warning("Graph capabilities will be disabled.")
+    graph_manager = None
+    graph_extractor = None
+
+# Now check and update indices (after Graph components are attached)
+if rag_system:
+    try:
+        # 智能檢查並更新索引
+        logger.info("Checking index status...")
+        check_result = rag_system.check_and_update_indices()
+        
+        if check_result['status'] == 'success':
+            if check_result['action_taken']:
+                logger.info(f"✓ Action taken: {check_result['action_taken']}")
+                logger.info(f"✓ Processed {check_result['details'].get('papers_processed', 0)} papers")
+            else:
+                logger.info("✓ Indices are up-to-date")
+        elif check_result['status'] == 'up_to_date':
+            logger.info("✓ Indices are healthy and up-to-date")
+        else:
+            logger.error(f"✗ Index check/update failed: {check_result.get('details', {}).get('error', 'Unknown error')}")
+    except Exception as e:
+        logger.error(f"Error during index check: {e}", exc_info=True)
+
 # Add this after initializing other components
 logger.info("Loading data categories...")
 categories_data = None
@@ -137,20 +186,6 @@ try:
 except Exception as e:
     logger.error(f"Failed to load data categories: {e}")
     categories_data = []
-# Initialize Ollama LLM for agent
-agent_llm = None
-try:
-    agent_llm = OllamaLLM(
-        model=model_name, # agent model
-        temperature=0,
-        base_url="http://localhost:11434"
-    )
-    # Test the connection
-    test_response = agent_llm.invoke("Hello")
-    logger.info("Agent Ollama connection successful")
-except Exception as e:
-    logger.error(f"Failed to connect to Ollama for agent: {e}")
-    logger.warning("Agent will use fallback routing")
 
 # Initialize ResearchInheritanceAnalyzer with separate LLM
 logger.info("Initializing ResearchInheritanceAnalyzer...")
@@ -228,18 +263,41 @@ def web_search_call(user_input: str) -> str:
 
     return result
 
+
+def graph_analysis_call(query: str) -> str:
+    """
+    Use this tool for MACRO-level questions: relationships, trends, aggregations across papers.
+    Examples: "Which papers use LSTM?", "Compare research goals", "List all datasets".
+    """
+    if not graph_manager:
+        return "Graph RAG is not available."
+    
+    logger.info(f"🔍 [Graph Tool] Querying: '{query}'")
+    try:
+        result = graph_manager.query_graph(query)
+        return f"[Graph Analysis Result]\n{result}"
+    except Exception as e:
+        logger.error(f"Graph tool error: {e}")
+        return f"Error querying graph: {str(e)}"
+
 # Create tools for the agent
 tools = [
     Tool(
         name="AssistantCall",
         func=assistant_call,
-        description="Use this for ALL paper-related queries including searching, summarizing, analyzing, translating, or explaining academic papers from the local database. This is the PRIMARY tool for any research paper questions unless the user explicitly requests internet search or mentions 'online', 'web search', or 'latest from internet'."
+        description="Use for specific details, summaries, or content retrieval from SINGLE or specific papers."
+    ),
+    
+    Tool(
+        name="GraphAnalysisCall",
+        func=graph_analysis_call,
+        description="Use for MACRO-level questions: finding papers by method/dataset, counting, trends, or cross-paper relationships. Keywords: 'which papers', 'list all', 'compare', 'how many', methods, datasets, domains, metrics."
     ),
 
     Tool(
         name="WebSearchCall",
         func=web_search_call,
-        description="ONLY use this when the user EXPLICITLY requests web/internet search with keywords like 'search online', 'search the web', 'find on internet', 'search internet', or 'web search'. Do NOT use this for general paper queries - those should use AssistantCall."
+        description="Use ONLY when the user EXPLICITLY requests web/internet search with keywords like 'search online', 'search the web', 'find on internet', 'search internet', or 'web search'."
     )
 ]
 
@@ -263,56 +321,76 @@ Thought: I now know the final answer
 Final Answer: the final answer to the original input question
 
 IMPORTANT ROUTING RULES:
-1. DEFAULT to AssistantCall for ALL paper-related queries (search, summarize, analyze, find papers, etc.)
-2. ONLY use WebSearchCall when user EXPLICITLY mentions: "search online", "search web", "find on internet", "search internet", "web search"
-3. Year mentions (2024, 2025) alone do NOT mean web search - use AssistantCall unless explicitly requested
+
+1. **GraphAnalysisCall** (Macro-View):
+   - USE WHEN: User asks "Which papers...", "List all...", "How many...", "Compare...", "What are the common methods...".
+   - KEYWORDS: Methods, Datasets, Domain, Metrics, Relationship, Trends, Count.
+   - Examples: "Which papers use LSTM?", "List all datasets", "How many papers in Smart Transportation?"
+
+2. **AssistantCall** (Micro-View):
+   - USE WHEN: User asks about content/details of a specific paper or wants summaries.
+   - KEYWORDS: Summarize, Explain, Abstract, Introduction, Methodology, Content.
+   - Examples: "Summarize this paper", "Explain the methodology in paper X"
+
+3. **WebSearchCall**:
+   - USE ONLY for explicit internet search requests.
+   - KEYWORDS: "search internet", "search online", "web search", "find on internet"
 
 Here are some examples:
 
-Example 1 - Summarization (Use AssistantCall):
-Question: Summarize research papers on deep learning
-Thought: This is asking to summarize papers. I should search and analyze papers from local database.
-Action: AssistantCall
-Action Input: Summarize research papers on deep learning
-Observation: [summary from local papers]
+Example 1 - Macro Query (Use GraphAnalysisCall):
+Question: Which papers use LSTM?
+Thought: This asks for papers by method. This is a macro-level query across papers.
+Action: GraphAnalysisCall
+Action Input: Which papers use LSTM?
+Observation: [list of papers using LSTM from graph]
 Thought: I now know the final answer
-Final Answer: Here are the summaries of deep learning papers from our database...
+Final Answer: Papers using LSTM include...
 
-Example 2 - Finding Papers (Use AssistantCall):
-Question: Find papers about transformer architectures
-Thought: User wants to find papers. No explicit mention of web search, so I should search local database.
-Action: AssistantCall
-Action Input: Find papers about transformer architectures
-Observation: [list of papers from database]
+Example 2 - Count Query (Use GraphAnalysisCall):
+Question: How many papers use the PeMSD7 dataset?
+Thought: This asks for a count across papers. This is a macro-level aggregation query.
+Action: GraphAnalysisCall
+Action Input: How many papers use the PeMSD7 dataset?
+Observation: [count from graph]
 Thought: I now know the final answer
-Final Answer: Here are the papers about transformer architectures...
+Final Answer: X papers use the PeMSD7 dataset.
 
-Example 3 - Year-based Query (Use AssistantCall):
-Question: What are the main research topics in 2024 papers?
-Thought: User mentions 2024 but doesn't explicitly request web search. I should query local database.
-Action: AssistantCall
-Action Input: What are the main research topics in 2024 papers?
-Observation: [analysis of 2024 papers in database]
+Example 3 - Comparison Query (Use GraphAnalysisCall):
+Question: Compare research goals in Smart Transportation domain
+Thought: This asks to compare across multiple papers. This is a macro-level query.
+Action: GraphAnalysisCall
+Action Input: Compare research goals in Smart Transportation domain
+Observation: [comparison from graph]
 Thought: I now know the final answer
-Final Answer: Based on our 2024 papers, the main research topics are...
+Final Answer: Research goals in Smart Transportation include...
 
-Example 4 - EXPLICIT Web Search (Use WebSearchCall):
-Question: Search the internet for latest papers on quantum computing
-Thought: User explicitly said "search the internet", so I must use WebSearchCall.
+Example 4 - Specific Paper Summary (Use AssistantCall):
+Question: Summarize the paper about traffic flow prediction
+Thought: This asks for content from a specific paper. This is a micro-level query.
+Action: AssistantCall
+Action Input: Summarize the paper about traffic flow prediction
+Observation: [summary from vector database]
+Thought: I now know the final answer
+Final Answer: The paper discusses...
+
+Example 5 - Content Explanation (Use AssistantCall):
+Question: Explain the methodology in the first paper
+Thought: This asks for detailed content. This is a micro-level query.
+Action: AssistantCall
+Action Input: Explain the methodology in the first paper
+Observation: [methodology details from vector database]
+Thought: I now know the final answer
+Final Answer: The methodology includes...
+
+Example 6 - Web Search (Use WebSearchCall):
+Question: Search the internet for latest LSTM papers
+Thought: User explicitly said "search the internet".
 Action: WebSearchCall
-Action Input: latest papers on quantum computing
+Action Input: latest LSTM papers
 Observation: [web search results]
 Thought: I now know the final answer
 Final Answer: Here are the latest papers from internet search...
-
-Example 5 - Translation/Analysis (Use AssistantCall):
-Question: Explain the methodology used in machine learning papers
-Thought: This requires analyzing papers from our database.
-Action: AssistantCall
-Action Input: Explain the methodology used in machine learning papers
-Observation: [analysis from local papers]
-Thought: I now know the final answer
-Final Answer: The common methodologies in our papers include...
 
 If the query looks like previous agent output or contains terms like Thought: or Action:, treat it as text to summarize and use AssistantCall.
 
@@ -375,6 +453,23 @@ def health():
             'message': ', '.join(message),
             'details': status_info
         }), 200
+
+@app.route('/graph/data', methods=['GET'])
+def get_graph_data():
+    """
+    Endpoint for frontend graph visualization
+    Returns nodes and edges from Neo4j graph database
+    """
+    if not graph_manager:
+        return jsonify({'error': 'Graph system not active'}), 503
+    
+    try:
+        limit = request.args.get('limit', default=100, type=int)
+        data = graph_manager.get_visualization_data(limit=limit)
+        return jsonify(data), 200
+    except Exception as e:
+        logger.error(f"Graph visualization error: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/query_stream', methods=['POST'])
 def query_stream():
@@ -892,6 +987,38 @@ def upload_paper():
             else:
                 logger.warning(f"PDF upload succeeded but indexing failed: {result.get('error')}")
                 message = 'Paper uploaded successfully, but indexing failed. Please restart service to update search index.'
+        
+        # Step 7: Synchronous Graph Indexing
+        if graph_manager and graph_extractor:
+            try:
+                logger.info(f"🚀 Starting Graph extraction for: {stored_filename}")
+                
+                # 1. Extract structured data
+                # Use 'pdf_text' which was extracted in Step 2
+                graph_data = graph_extractor.extract(pdf_text)
+                
+                # 2. Write to Neo4j (with bilingual domain support)
+                # Use stored_filename as paper_id to match vector store
+                success = graph_manager.add_paper_metadata(
+                    paper_id=stored_filename,
+                    title=paper_data.get('論文標題', 'Untitled'),
+                    year=str(paper_data.get('年份', 'Unknown')),
+                    research_goal=graph_data.get('research_goal', ''),
+                    methods=graph_data.get('methods', []),
+                    datasets=graph_data.get('datasets', []),
+                    domain=graph_data.get('domain', 'Unknown'),
+                    metrics=graph_data.get('metrics', []),
+                    domain_zh=graph_data.get('domain_zh', '未知領域')
+                )
+                
+                if success:
+                    logger.info(f"✅ Graph ingestion successful for {stored_filename}")
+                else:
+                    logger.error(f"❌ Graph ingestion failed for {stored_filename}")
+                    
+            except Exception as e:
+                # Log error but don't fail the whole upload if graph part fails
+                logger.error(f"❌ Error during graph processing: {e}", exc_info=True)
         
         # Return success with extracted metadata and classification
         return jsonify({

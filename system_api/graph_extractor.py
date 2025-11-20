@@ -22,7 +22,7 @@ class GraphDataExtractor:
     針對 Domain 和 Metric 進行了嚴格標準化，並大幅增強了指標的關鍵字搜尋能力
     """
     
-    # 定義標準領域清單 (Taxonomy)
+    # 定義標準領域清單 (Taxonomy) - 英文
     ALLOWED_DOMAINS = [
         "Smart Transportation",      # 智慧交通 (捷運, 公車, 車流, YouBike)
         "Healthcare",                # 智慧醫療 (疾病辨識, 內視鏡, 醫院人流)
@@ -36,6 +36,24 @@ class GraphDataExtractor:
         "Disaster Management",       # 災害管理 (人流疏散, 防災)
         "Smart Building"             # [新增] 智慧建築 (空調, 室內溫度, 節能)
     ]
+    
+    # 中英文域名映射表
+    DOMAIN_TRANSLATIONS = {
+        "Smart Transportation": "智慧交通",
+        "Healthcare": "智慧醫療",
+        "Smart Manufacturing": "智慧製造",
+        "Agriculture": "智慧農業",
+        "Environmental Monitoring": "環境監測",
+        "Finance": "金融科技",
+        "Computer Vision": "電腦視覺",
+        "Sports Analytics": "運動分析",
+        "Tourism": "觀光旅遊",
+        "Disaster Management": "災害管理",
+        "Smart Building": "智慧建築"
+    }
+    
+    # 反向映射（中文到英文）
+    DOMAIN_TRANSLATIONS_REVERSE = {v: k for k, v in DOMAIN_TRANSLATIONS.items()}
 
     # Prompt 優化：加入具體的映射規則與清理指令
     EXTRACTION_PROMPT = """
@@ -132,6 +150,9 @@ class GraphDataExtractor:
                 # 3. 若都不符合，設為 Unknown
                 if not found:
                     data['domain'] = "Unknown"
+            
+            # 添加中文域名
+            data['domain_zh'] = self.DOMAIN_TRANSLATIONS.get(data['domain'], "未知領域")
 
             # 移除空值
             data['methods'] = [m for m in data['methods'] if m]

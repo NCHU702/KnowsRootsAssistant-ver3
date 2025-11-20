@@ -89,10 +89,12 @@ class GraphManager:
         methods: List[str], 
         datasets: List[str],
         domain: str,         # [新增]
-        metrics: List[str]   # [新增]
+        metrics: List[str],   # [新增]
+        domain_zh: str = None  # [雙語支援]
     ) -> bool:
         """
         將論文的結構化資訊寫入圖資料庫 (包含 Domain 和 Metrics)
+        支援雙語域名 (domain 英文, domain_zh 中文)
         """
         if not self.graph:
             return False
@@ -119,8 +121,9 @@ class GraphManager:
             MERGE (p)-[:EVALUATED_ON]->(d)
         )
 
-        // 4. Domain [新增]
+        // 4. Domain [雙語支援]
         MERGE (dom:Domain {name: $domain})
+        SET dom.name_zh = $domain_zh
         MERGE (p)-[:APPLIED_IN]->(dom)
 
         // 5. Metrics [新增]
@@ -135,6 +138,7 @@ class GraphManager:
             clean_datasets = [d.strip() for d in datasets if d and d.strip()]
             clean_metrics = [met.strip() for met in metrics if met and met.strip()]
             clean_domain = domain.strip() if domain else "General"
+            clean_domain_zh = domain_zh.strip() if domain_zh else "通用"
             
             params = {
                 "paper_id": paper_id,
@@ -144,6 +148,7 @@ class GraphManager:
                 "methods": clean_methods,
                 "datasets": clean_datasets,
                 "domain": clean_domain,
+                "domain_zh": clean_domain_zh,
                 "metrics": clean_metrics
             }
             
@@ -170,6 +175,18 @@ class GraphManager:
         2. Use case-insensitive matching (e.g. toLower(n.name) CONTAINS toLower("keyword")).
         3. Return specific values (e.g. p.title, m.name), not just nodes.
         4. Do NOT include explanations.
+        5. IMPORTANT: Domain nodes have BILINGUAL names:
+           - dom.name: English name (e.g., "Healthcare", "Smart Manufacturing")
+           - dom.name_zh: Chinese name (e.g., "智慧醫療", "智慧製造")
+           When querying domains, search BOTH properties with OR:
+           WHERE toLower(dom.name) CONTAINS "keyword" OR toLower(dom.name_zh) CONTAINS "keyword"
+        6. BROAD SEARCH STRATEGY: When the user asks "which papers are related to X" or "find papers about X", 
+           you MUST search in multiple places to ensure high recall:
+           - Paper title (p.title)
+           - ResearchGoal summary (g.summary)
+           - Domain name (dom.name AND dom.name_zh)
+           - Dataset name (d.name)
+           Use OPTIONAL MATCH and OR conditions to catch all relevant papers.
         
         Schema:
           Nodes: 
@@ -177,7 +194,7 @@ class GraphManager:
             - ResearchGoal (summary)
             - Method (name)
             - Dataset (name)
-            - Domain (name)
+            - Domain (name [English], name_zh [Chinese])
             - Metric (name)
           Relationships:
             - (:Paper)-[:AIMS_TO]->(:ResearchGoal)
@@ -189,8 +206,21 @@ class GraphManager:
         Examples:
         Q: "Which papers use LSTM in Healthcare?"
         A: MATCH (p:Paper)-[:USES_METHOD]->(m:Method), (p)-[:APPLIED_IN]->(dom:Domain) 
-           WHERE toLower(m.name) CONTAINS "lstm" AND toLower(dom.name) CONTAINS "healthcare" 
+           WHERE toLower(m.name) CONTAINS "lstm" 
+           AND (toLower(dom.name) CONTAINS "healthcare" OR toLower(dom.name_zh) CONTAINS "醫療")
            RETURN p.title
+        
+        Q: "哪些研究和人流有關?" (Which research is related to pedestrian flow?)
+        A: MATCH (p:Paper)
+           OPTIONAL MATCH (p)-[:AIMS_TO]->(g:ResearchGoal)
+           OPTIONAL MATCH (p)-[:APPLIED_IN]->(dom:Domain)
+           OPTIONAL MATCH (p)-[:EVALUATED_ON]->(d:Dataset)
+           WITH p, g, dom, d
+           WHERE toLower(p.title) CONTAINS "pedestrian" OR toLower(p.title) CONTAINS "人流"
+              OR toLower(g.summary) CONTAINS "pedestrian" OR toLower(g.summary) CONTAINS "人流"
+              OR toLower(dom.name) CONTAINS "pedestrian" OR toLower(dom.name_zh) CONTAINS "人流"
+              OR toLower(d.name) CONTAINS "pedestrian" OR toLower(d.name) CONTAINS "人流"
+           RETURN DISTINCT p.title, p.year
         
         Q: "List papers evaluated with RMSE."
         A: MATCH (p:Paper)-[:EVALUATED_WITH]->(met:Metric) 
@@ -287,3 +317,61 @@ class GraphManager:
         except Exception as e:
             logger.error(f"Visualization data fetch failed: {e}")
             return {"error": str(e)}
+    
+    def get_paper_count(self) -> int:
+        """
+        獲取 Neo4j 中 Paper 節點的總數
+        
+        Returns:
+            論文數量
+        """
+        try:
+            query = "MATCH (p:Paper) RETURN count(p) as count"
+            result = self.graph.query(query)
+            if result and len(result) > 0:
+                return result[0].get('count', 0)
+            return 0
+        except Exception as e:
+            logger.error(f"Failed to get paper count: {e}")
+            return 0
+    
+    def get_all_paper_ids(self) -> List[str]:
+        """
+        獲取 Neo4j 中所有 Paper 節點的 paper_id
+        
+        Returns:
+            paper_id 列表
+        """
+        try:
+            query = "MATCH (p:Paper) RETURN p.paper_id as paper_id"
+            result = self.graph.query(query)
+            return [row.get('paper_id', '') for row in result if row.get('paper_id')]
+        except Exception as e:
+            logger.error(f"Failed to get paper IDs: {e}")
+            return []
+    
+    def delete_paper(self, paper_id: str) -> bool:
+        """
+        從 Neo4j 刪除指定的 Paper 節點及其所有關聯關係
+        
+        Args:
+            paper_id: 要刪除的論文 ID
+            
+        Returns:
+            是否成功刪除
+        """
+        if not self.graph:
+            return False
+        
+        try:
+            # 刪除 Paper 節點及其所有關聯關係
+            query = """
+            MATCH (p:Paper {paper_id: $paper_id})
+            DETACH DELETE p
+            """
+            self.graph.query(query, params={"paper_id": paper_id})
+            logger.info(f"✓ Deleted paper from Graph: {paper_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete paper {paper_id} from Graph: {e}")
+            return False
