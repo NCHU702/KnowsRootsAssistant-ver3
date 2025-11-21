@@ -38,7 +38,8 @@ class IndexManager:
         layer2: Layer2VectorStore,
         abstract_extractor: AbstractExtractor,
         backup_dir: str = "./vectorstore/backups",
-        max_backups: int = 5
+        max_backups: int = 5,
+        chunk_classifier: Optional[Any] = None
     ):
         """
         Initialize Index Manager
@@ -49,6 +50,7 @@ class IndexManager:
             abstract_extractor: Abstract extractor instance
             backup_dir: Directory for backups
             max_backups: Maximum number of backups to keep
+            chunk_classifier: Optional ChunkClassifier for semantic classification
         """
         self.layer1 = layer1
         self.layer2 = layer2
@@ -56,6 +58,8 @@ class IndexManager:
         self.text_preprocessor = TextPreprocessor()
         self.backup_dir = backup_dir
         self.max_backups = max_backups
+        self.chunk_classifier = chunk_classifier
+        
         # Optional Graph components (can be attached later)
         self.graph_manager: Optional[Any] = None
         self.graph_extractor: Optional[Any] = None
@@ -66,6 +70,8 @@ class IndexManager:
         logger.info(f"Index Manager initialized")
         logger.info(f"  Backup directory: {backup_dir}")
         logger.info(f"  Max backups: {max_backups}")
+        if chunk_classifier:
+            logger.info(f"  Chunk Classifier: enabled")
 
     def set_graph_components(self, graph_manager: Optional[Any], graph_extractor: Optional[Any]):
         """Attach GraphManager and GraphDataExtractor for optional graph ingestion.
@@ -75,7 +81,15 @@ class IndexManager:
         """
         self.graph_manager = graph_manager
         self.graph_extractor = graph_extractor
-        logger.info("✓ Graph components attached to IndexManager")
+
+        # Rollback: do NOT initialize the query-time DynamicEntityExtractor here.
+        # The dynamic extraction feature was disabled per recent changes and will
+        # be re-introduced later under a revised design if desired.
+        self.dynamic_extractor = None
+        if graph_manager and graph_extractor:
+            logger.info("✓ Graph components attached to IndexManager (dynamic extractor disabled)")
+        else:
+            logger.info("✓ Graph components not fully attached")
     
     def add_document(
         self,
@@ -152,6 +166,35 @@ class IndexManager:
             
             logger.info(f"  ✓ Created {len(chunks)} chunks")
             
+            # Step 4.5: Classify chunks (NEW - Graph-first enhancement)
+            if self.chunk_classifier:
+                logger.info("Step 4.5: Classifying chunks...")
+                try:
+                    classifications = self.chunk_classifier.classify_chunks_batch(chunks)
+                    
+                    for chunk, classification in zip(chunks, classifications):
+                        chunk.metadata['chunk_type'] = classification['chunk_type']
+                        chunk.metadata['classification_confidence'] = classification['confidence']
+                        chunk.metadata['classification_method'] = classification['method']
+                    
+                    # Log summary
+                    type_counts = {}
+                    for classification in classifications:
+                        chunk_type = classification['chunk_type']
+                        type_counts[chunk_type] = type_counts.get(chunk_type, 0) + 1
+                    
+                    logger.info(f"  ✓ Chunks classified: {type_counts}")
+                    
+                except Exception as e:
+                    logger.warning(f"  ⚠️  Chunk classification failed: {e}")
+                    logger.warning(f"  Continuing without classification...")
+                    # Set default type if classification fails
+                    for chunk in chunks:
+                        chunk.metadata['chunk_type'] = 'other'
+                        chunk.metadata['classification_confidence'] = 0.0
+            else:
+                logger.info("  ℹ️  Chunk classification disabled")
+            
             # Step 5: Add to Layer 1
             logger.info("Step 5: Adding to Layer 1...")
             success = self.layer1.add_abstract(abstract_result)
@@ -182,7 +225,9 @@ class IndexManager:
             # Step 7: Optional Graph ingestion (do not fail the index operation)
             try:
                 if self.graph_manager and self.graph_extractor:
-                    logger.info("Step 7: Indexing metadata to Graph DB (optional)...")
+                    logger.info("Step 7: Indexing to Graph DB (Paper-level + Chunk-level)...")
+                    
+                    # 7.1: Paper-level extraction (保留原有功能)
                     try:
                         extract_result = self.graph_extractor.extract(pdf_text)
                     except Exception as e:
@@ -205,9 +250,14 @@ class IndexManager:
 
                         # Call GraphManager (may raise, but we catch below)
                         self.graph_manager.add_paper_metadata(**gm_args)
-                        logger.info(f"  ✓ Graph metadata indexed for paper: {paper_id}")
+                        logger.info(f"  ✓ Paper-level graph metadata indexed")
                     except Exception as e:
-                        logger.warning(f"Failed to write graph metadata for {paper_id}: {e}")
+                        logger.warning(f"Failed to write paper-level graph metadata: {e}")
+                    
+                    # 7.2: Chunk-level extraction moved to query-time (on-demand)
+                    # Chunk nodes are still created for potential future use
+                    # Entity extraction happens dynamically during queries for retrieved chunks
+                    logger.info("  ℹ️  Chunk-level entity extraction deferred to query-time")
 
             except Exception:
                 # Defensive: ensure no exception here can break the main flow

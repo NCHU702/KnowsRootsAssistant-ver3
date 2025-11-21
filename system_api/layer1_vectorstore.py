@@ -265,6 +265,7 @@ class Layer1VectorStore:
             
         except Exception as e:
             logger.error(f"Layer 1 search with scores failed: {e}")
+            logger.exception("Full traceback:")
             return []
     
     def add_abstract(self, abstract_dict: Dict[str, Any]) -> bool:
@@ -277,10 +278,6 @@ class Layer1VectorStore:
         Returns:
             True if successful, False otherwise
         """
-        if not self.vectorstore:
-            logger.error("VectorStore not initialized. Call build_index() or load() first.")
-            return False
-        
         try:
             abstract_text = abstract_dict.get('abstract', '')
             if not abstract_text or len(abstract_text) < 50:
@@ -302,9 +299,18 @@ class Layer1VectorStore:
             # Create document
             doc = Document(page_content=abstract_text, metadata=metadata)
             
-            # Add to index
-            self.vectorstore.add_documents([doc])
-            self._paper_count += 1
+            # If vectorstore not initialized, create it with first document
+            if not self.vectorstore:
+                logger.info("Initializing Layer 1 vectorstore with first document...")
+                from system_api.progress_embeddings import ProgressEmbeddings
+                progress_embeddings = ProgressEmbeddings(self.embeddings, label="Layer 1")
+                self.vectorstore = FAISS.from_documents([doc], embedding=progress_embeddings)
+                self._paper_count = 1
+                logger.info("  ✓ Layer 1 vectorstore initialized")
+            else:
+                # Add to existing index
+                self.vectorstore.add_documents([doc])
+                self._paper_count += 1
             
             logger.info(f"Added abstract for paper {abstract_dict.get('paper_id')} to Layer 1")
             

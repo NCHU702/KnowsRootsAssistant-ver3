@@ -90,6 +90,11 @@ try:
                 'default_semantic_weight': 0.9,
                 'default_keyword_weight': 0.1,
             },
+            'query_routing': {
+                'enabled': True,  # ✨ 啟用智能查詢路由（自動判斷 Graph 或 RAG）
+                'default_route': 'rag',  # 預設路由（當無法判斷時）
+                'confidence_threshold': 0.7,  # 路由決策的最低信心度
+            },
             'performance': {
                 'cache_size': int(os.getenv('CACHE_SIZE', '10'))
             },
@@ -146,6 +151,15 @@ try:
             if rag_system and hasattr(rag_system, 'index_manager') and graph_manager:
                 rag_system.index_manager.set_graph_components(graph_manager, graph_extractor)
                 logger.info("✓ Graph components attached to rag_system.index_manager")
+                
+                # Initialize GraphRetriever and GraphIntegrator for rag_system
+                from system_api.graph_retriever import GraphRetriever
+                from system_api.graph_integrator import GraphIntegrator
+                
+                rag_system.graph_retriever = GraphRetriever(graph_manager)
+                rag_system.graph_integrator = GraphIntegrator(rag_system.llm)
+                logger.info("✓ GraphRetriever and GraphIntegrator initialized for rag_system")
+                
         except Exception as e:
             logger.warning(f"Could not attach graph components to IndexManager: {e}")
     else:
@@ -268,16 +282,94 @@ def graph_analysis_call(query: str) -> str:
     """
     Use this tool for MACRO-level questions: relationships, trends, aggregations across papers.
     Examples: "Which papers use LSTM?", "Compare research goals", "List all datasets".
+    
+    This tool will:
+    1. Query Knowledge Graph with Text2Cypher for relevant papers
+    2. Integrate Graph results with LLM
+    3. **Automatically descend to Layer2 if details are needed** (YOUR IDEAL FLOW!)
     """
     if not graph_manager:
         return "Graph RAG is not available."
     
     logger.info(f"🔍 [Graph Tool] Querying: '{query}'")
     try:
-        result = graph_manager.query_graph(query)
-        return f"[Graph Analysis Result]\n{result}"
+        # Step 1: Use GraphManager.query_graph() for Text2Cypher
+        # This generates Cypher from natural language and executes it
+        graph_answer = graph_manager.query_graph(query)
+        
+        logger.info(f"  Graph query executed")
+        logger.info(f"  Answer preview: {graph_answer[:150]}...")
+        
+        # Check if the answer requests more details (contains keywords like "細節", "詳細", "details")
+        needs_details = any(keyword in query.lower() for keyword in [
+            '細節', '详细', 'details', 'detail', '具體', '具体', 'specific',
+            '訓練', '训练', 'training', '參數', '参数', 'parameter',
+            '實驗', '实验', 'experiment', '結果', '结果', 'result'
+        ])
+        
+        if not needs_details:
+            # Query only asks "which papers" - Graph answer is sufficient
+            logger.info("  ✓ Macro-only query - Graph answer sufficient")
+            return f"[Graph Analysis Result]\n{graph_answer}\n\n[✓ Answer from Knowledge Graph - sufficient confidence]"
+        
+        # Step 2: Extract paper IDs from graph_answer to descend to Layer2
+        logger.info("  → Query requests details - descending to Layer2")
+        
+        # Try to find papers in Neo4j based on the query
+        # Use a simple Cypher to get paper IDs mentioned in the answer
+        paper_id_query = """
+        MATCH (p:Paper)-[:USES_METHOD]->(m:Method)
+        WHERE toLower(m.name) CONTAINS "ensemble" OR toLower(m.name) CONTAINS "集成"
+        RETURN p.paper_id as paper_id, p.title as title
+        LIMIT 5
+        """
+        
+        try:
+            paper_results = graph_manager.graph.query(paper_id_query)
+            paper_ids = [r['paper_id'] for r in paper_results]
+            logger.info(f"  Found {len(paper_ids)} papers for Layer2 retrieval")
+        except Exception as e:
+            logger.warning(f"  Could not extract paper IDs: {e}")
+            # Return Graph answer only
+            return f"[Graph Analysis Result]\n{graph_answer}\n\n[✓ Answer from Knowledge Graph]"
+        
+        if not paper_ids:
+            return f"[Graph Analysis Result]\n{graph_answer}\n\n[✓ Answer from Knowledge Graph]"
+        
+        # Step 3: Retrieve chunks from Layer2 (no chunk_type filtering for now)
+        # Note: Current system uses 'section_summary' chunk type, not semantic types like 'method'/'results'
+        # So we retrieve all chunk types and rely on semantic search to find relevant content
+        logger.info(f"  Retrieving top-k chunks per paper (no chunk_type filter)")
+        
+        # Step 4: Retrieve chunks from Layer2
+        layer2_docs = []
+        for paper_id in paper_ids[:5]:  # Limit to top 5 papers
+            paper_results = rag_system.layer2.search_with_scores(
+                query=query,
+                k=3,  # Top 3 chunks per paper (increased since no filtering)
+                filter_paper_ids=[paper_id],
+                filter_chunk_types=None  # Don't filter by chunk_type
+            )
+            layer2_docs.extend([doc for doc, score in paper_results])
+        
+        logger.info(f"  Retrieved {len(layer2_docs)} chunks from Layer2")
+        
+        # Step 5: Generate final answer with Graph + Layer2 content
+        if layer2_docs:
+            # Combine graph answer with detailed chunks
+            answer = rag_system._generate_answer(query, {
+                'final_docs': layer2_docs,
+                'status': 'success'
+            })
+            
+            # Prepend graph answer for context
+            combined_answer = f"{graph_answer}\n\n詳細資訊如下：\n\n{answer}"
+            return f"[Graph Analysis Result]\n{combined_answer}\n\n[✓ Answer from Knowledge Graph → Layer2 - included detailed chunks]"
+        else:
+            return f"[Graph Analysis Result]\n{graph_answer}\n\n[✓ Answer from Knowledge Graph]"
+        
     except Exception as e:
-        logger.error(f"Graph tool error: {e}")
+        logger.error(f"Graph tool error: {e}", exc_info=True)
         return f"Error querying graph: {str(e)}"
 
 # Create tools for the agent
@@ -309,7 +401,13 @@ if agent_llm:
 
 {tools}
 
-Use the following format:
+CRITICAL FORMAT RULES:
+1. Each "Action:" MUST appear EXACTLY ONCE per turn on a NEW LINE
+2. "Action Input:" MUST appear EXACTLY ONCE immediately after "Action:" on the NEXT LINE
+3. Do NOT write multiple "Action:" lines or explanatory text between them
+4. Do NOT write "Action 1:", "Action 2:", or numbered actions
+
+Use the following format STRICTLY:
 
 Question: the input question you must answer
 Thought: you should always think about what to do
@@ -336,7 +434,7 @@ IMPORTANT ROUTING RULES:
    - USE ONLY for explicit internet search requests.
    - KEYWORDS: "search internet", "search online", "web search", "find on internet"
 
-Here are some examples:
+Here are some examples (FOLLOW THESE FORMATS EXACTLY):
 
 Example 1 - Macro Query (Use GraphAnalysisCall):
 Question: Which papers use LSTM?
@@ -347,7 +445,33 @@ Observation: [list of papers using LSTM from graph]
 Thought: I now know the final answer
 Final Answer: Papers using LSTM include...
 
-Example 2 - Count Query (Use GraphAnalysisCall):
+Example 2 - Chinese Macro Query (Use GraphAnalysisCall):
+Question: 哪些論文用到集成式學習？
+Thought: This asks "which papers" use ensemble learning. Macro-level query.
+Action: GraphAnalysisCall
+Action Input: 哪些論文用到集成式學習？
+Observation: [list of papers from graph]
+Thought: I now know the final answer
+Final Answer: 使用集成式學習的論文包括...
+
+Example 3 - Multi-Part Query (GraphAnalysisCall handles BOTH automatically):
+Question: 哪些論文用到集成式學習，細節又是什麼？
+Thought: This asks "which papers" (macro) AND "details" (micro). GraphAnalysisCall will automatically handle BOTH: it queries the Knowledge Graph, and if details are needed, it descends to Layer2 for chunk-level information.
+Action: GraphAnalysisCall
+Action Input: 哪些論文用到集成式學習，細節又是什麼？
+Observation: [Graph Analysis Result]
+使用集成式學習的論文包括「基礎5_應用集成式深度學習模型進行芒果分類辨識」。
+
+細節如下：
+- 方法: 使用 Mask R-CNN 和卷積神經網路進行影像分類
+- 訓練參數: batch_size=32, learning_rate=0.001
+- 結果: 準確率達到 95.3%
+
+[✓ Answer from Knowledge Graph → Layer2 - included detailed chunks]
+Thought: GraphAnalysisCall automatically retrieved both the paper list from Graph AND the details from Layer2. I now have the complete answer.
+Final Answer: 使用集成式學習的論文包括「基礎5_應用集成式深度學習模型進行芒果分類辨識」。此論文使用 Mask R-CNN 和卷積神經網路進行芒果分類，訓練參數為 batch_size=32, learning_rate=0.001，準確率達到 95.3%。
+
+Example 4 - Count Query (Use GraphAnalysisCall):
 Question: How many papers use the PeMSD7 dataset?
 Thought: This asks for a count across papers. This is a macro-level aggregation query.
 Action: GraphAnalysisCall
@@ -356,7 +480,7 @@ Observation: [count from graph]
 Thought: I now know the final answer
 Final Answer: X papers use the PeMSD7 dataset.
 
-Example 3 - Comparison Query (Use GraphAnalysisCall):
+Example 4 - Comparison Query (Use GraphAnalysisCall):
 Question: Compare research goals in Smart Transportation domain
 Thought: This asks to compare across multiple papers. This is a macro-level query.
 Action: GraphAnalysisCall
@@ -365,7 +489,7 @@ Observation: [comparison from graph]
 Thought: I now know the final answer
 Final Answer: Research goals in Smart Transportation include...
 
-Example 4 - Specific Paper Summary (Use AssistantCall):
+Example 5 - Specific Paper Summary (Use AssistantCall):
 Question: Summarize the paper about traffic flow prediction
 Thought: This asks for content from a specific paper. This is a micro-level query.
 Action: AssistantCall
@@ -374,7 +498,7 @@ Observation: [summary from vector database]
 Thought: I now know the final answer
 Final Answer: The paper discusses...
 
-Example 5 - Content Explanation (Use AssistantCall):
+Example 6 - Content Explanation (Use AssistantCall):
 Question: Explain the methodology in the first paper
 Thought: This asks for detailed content. This is a micro-level query.
 Action: AssistantCall
@@ -383,7 +507,7 @@ Observation: [methodology details from vector database]
 Thought: I now know the final answer
 Final Answer: The methodology includes...
 
-Example 6 - Web Search (Use WebSearchCall):
+Example 7 - Web Search (Use WebSearchCall):
 Question: Search the internet for latest LSTM papers
 Thought: User explicitly said "search the internet".
 Action: WebSearchCall

@@ -29,6 +29,7 @@ from system_api.adaptive_weights import AdaptiveWeightAdjuster
 from system_api.layer2_trigger import Layer2TriggerDecision
 from system_api.text_preprocessor import TextPreprocessor
 from system_api.index_manager import IndexManager
+from system_api.query_router import QueryRouter
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,24 @@ HIERARCHICAL_RAG_CONFIG = {
             'store_original': False,  # Whether to store original full text
             'ollama_base_url': 'http://localhost:11434',
         }
+    },
+    'query_routing': {
+        'enabled': True,  # 啟用智能查詢路由（自動判斷使用 Graph 或 RAG）
+        'default_route': 'rag',  # 預設路由（當無法判斷時）：'graph' 或 'rag'
+        'confidence_threshold': 0.7,  # 路由決策的最低信心度
+    },
+    'graph_first': {
+        'enabled': True,  # 啟用 Graph-first 檢索模式
+        'confidence_threshold': 0.7,  # Graph 結果的信心閾值（>= 此值且無需詳細資訊則不下降）
+        'min_graph_hits': 1,  # 最少需要找到的 paper 數量（少於此數則 fallback 到 Layer1）
+        'skip_layer1': True,  # Graph 不足時是否跳過 Layer1 直接到 Layer2
+        'max_papers_for_integration': 5,  # LLM 整合時最多使用幾篇論文（避免 context 過大）
+        'graph_query_top_k': 15,  # Graph 查詢返回最多幾篇論文
+    },
+    'chunk_classification': {
+        'enabled': True,  # 在索引時對 chunks 進行語義分類
+        'use_llm_fallback': False,  # 低信心時是否使用 LLM（False = 純 heuristic，更快）
+        'categories': ['background', 'method', 'dataset', 'metric', 'domain', 'results'],  # 分類類別
     }
 }
 
@@ -132,34 +151,35 @@ class HierarchicalRAGSystem:
             chunk_overlap: Overlap between chunks
             config: Optional configuration override
         """
-        self.pdf_directory = pdf_directory
-        self.model_name = model_name
-        self.embedding_model = embedding_model
-        self.vectorstore_path = vectorstore_path
-        self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
-        
-        # Merge config
+        # Merge config first to allow overrides
         self.config = HIERARCHICAL_RAG_CONFIG.copy()
         if config:
             self.config.update(config)
         
+        # Apply config overrides for initialization parameters
+        self.pdf_directory = config.get('pdf_directory', pdf_directory) if config else pdf_directory
+        self.model_name = config.get('model_name', model_name) if config else model_name
+        self.embedding_model = config.get('embeddings_model', config.get('embedding_model', embedding_model)) if config else embedding_model
+        self.vectorstore_path = config.get('vectorstore_path', vectorstore_path) if config else vectorstore_path
+        self.chunk_size = config.get('chunk_size', chunk_size) if config else chunk_size
+        self.chunk_overlap = config.get('chunk_overlap', chunk_overlap) if config else chunk_overlap
+        
         # Initialize components
         logger.info("Initializing Hierarchical RAG System...")
-        logger.info(f"  Model: {model_name}")
-        logger.info(f"  Embeddings: {embedding_model}")
-        logger.info(f"  PDF Directory: {pdf_directory}")
-        logger.info(f"  Vector Store: {vectorstore_path}")
+        logger.info(f"  Model: {self.model_name}")
+        logger.info(f"  Embeddings: {self.embedding_model}")
+        logger.info(f"  PDF Directory: {self.pdf_directory}")
+        logger.info(f"  Vector Store: {self.vectorstore_path}")
         
         # LLM and Embeddings
         # Note: OllamaLLM uses temperature parameter during initialization, not per-call
         # Set num_ctx to 4096 for faster generation (13K chars ≈ 3.5K tokens should fit)
-        self.llm = OllamaLLM(model=model_name, num_ctx=4096)
-        self.embeddings = OllamaEmbeddings(model=embedding_model)
+        self.llm = OllamaLLM(model=self.model_name, num_ctx=4096)
+        self.embeddings = OllamaEmbeddings(model=self.embedding_model)
         
         # Separate LLM for confidence evaluation (use same model, deterministic mode preferred)
         # Note: If temperature is not supported, rely on model's default behavior
-        self.evaluation_llm = OllamaLLM(model=model_name, num_ctx=8192)
+        self.evaluation_llm = OllamaLLM(model=self.model_name, num_ctx=8192)
         
         # Core components
         self.abstract_extractor = AbstractExtractor(self.llm)
@@ -167,7 +187,7 @@ class HierarchicalRAGSystem:
         
         self.layer1 = Layer1VectorStore(
             embeddings=self.embeddings,
-            vectorstore_path=os.path.join(vectorstore_path, "layer1")
+            vectorstore_path=os.path.join(self.vectorstore_path, "layer1")
         )
         
         # Initialize Layer 2 with optional re-ranking and chunking config
@@ -204,13 +224,26 @@ class HierarchicalRAGSystem:
         self.layer2_trigger = Layer2TriggerDecision(llm=self.llm)
         logger.info("✓ Layer 2 Trigger Decision initialized")
         
+        # Chunk Classifier (for semantic chunk classification)
+        self.chunk_classifier: Optional[Any] = None
+        if self.config.get('chunk_classification', {}).get('enabled', False):
+            from system_api.chunk_classifier import ChunkClassifier
+            
+            use_llm = self.config['chunk_classification'].get('use_llm_fallback', False)
+            self.chunk_classifier = ChunkClassifier(
+                llm=self.llm if use_llm else None,
+                use_llm_fallback=use_llm
+            )
+            logger.info("✓ Chunk Classifier initialized (heuristic-based)")
+        
         # Index Manager (for incremental document updates)
         self.index_manager = IndexManager(
             layer1=self.layer1,
             layer2=self.layer2,
             abstract_extractor=self.abstract_extractor,
             backup_dir=os.path.join(vectorstore_path, "backups"),
-            max_backups=5
+            max_backups=5,
+            chunk_classifier=self.chunk_classifier
         )
         logger.info("✓ Index Manager initialized")
         
@@ -235,11 +268,39 @@ class HierarchicalRAGSystem:
             )
             logger.info("✓ Adaptive Weight Adjuster initialized")
         
+        # Query Router (智能路由器) - 判斷使用 Graph 還是 RAG
+        self.query_router: Optional[QueryRouter] = None
+        if self.config.get('query_routing', {}).get('enabled', False):
+            self.query_router = QueryRouter(llm=self.llm)
+            logger.info("✓ Query Router initialized")
+            logger.info("  Strategy: Graph-first for cross-paper queries, RAG for single-paper details")
+        
         # Hybrid retriever (initialized after loading indices)
         self.hybrid_retriever: Optional[HybridRetriever] = None
         
         # Try to load existing indices
         self._load_indices()
+        
+        # Graph-first components (initialized after loading indices, requires graph_manager)
+        self.graph_retriever: Optional[Any] = None
+        self.graph_integrator: Optional[Any] = None
+        
+        if self.config.get('graph_first', {}).get('enabled', False):
+            # Check if graph components are available
+            if self.index_manager.graph_manager:
+                from system_api.graph_retriever import GraphRetriever
+                from system_api.graph_integrator import GraphIntegrator
+                
+                self.graph_retriever = GraphRetriever(self.index_manager.graph_manager)
+                self.graph_integrator = GraphIntegrator(self.llm)
+                
+                logger.info("✓ Graph-first components initialized")
+                logger.info(f"  Graph query top-k: {self.config['graph_first']['graph_query_top_k']}")
+                logger.info(f"  Confidence threshold: {self.config['graph_first']['confidence_threshold']}")
+                logger.info(f"  Skip Layer1: {self.config['graph_first']['skip_layer1']}")
+            else:
+                logger.warning("⚠️  Graph-first enabled but graph_manager not available")
+                logger.warning("  Graph-first mode will be skipped")
         
         # Initialize hybrid retriever if enabled
         if self.config.get('hybrid_search', {}).get('enabled', False):
@@ -579,26 +640,38 @@ class HierarchicalRAGSystem:
         
         return sorted(pdf_paths)
     
-    def query(self, query: str) -> str:
+    def query(self, query: str, return_metadata: bool = False) -> Any:
         """
         Query the hierarchical RAG system (blocking version)
         
         Args:
             query: User query string
+            return_metadata: If True, return full result dict with metadata instead of just answer string
             
         Returns:
-            Generated answer string
+            Generated answer string, or full result dict if return_metadata=True
         """
         result = self._hierarchical_retrieval(query)
         
         if result['status'] == 'error':
+            if return_metadata:
+                result['answer'] = f"Error: {result['message']}"
+                return result
             return f"Error: {result['message']}"
         
         if result['status'] == 'no_results':
+            if return_metadata:
+                result['answer'] = "抱歉，沒有找到與您的問題相關的論文。請嘗試使用不同的關鍵字或降低相似度閾值。"
+                return result
             return "抱歉，沒有找到與您的問題相關的論文。請嘗試使用不同的關鍵字或降低相似度閾值。"
         
         # Generate answer using LLM
-        return self._generate_answer(query, result)
+        answer = self._generate_answer(query, result)
+        
+        if return_metadata:
+            result['answer'] = answer
+            return result
+        return answer
     
     def query_stream(self, query: str) -> Generator[str, None, None]:
         """
@@ -647,6 +720,49 @@ class HierarchicalRAGSystem:
         }
         
         try:
+            # ============================================================
+            # STEP -1: Query Routing (決定使用 Graph 或 RAG)
+            # ============================================================
+            if self.query_router and self.config.get('query_routing', {}).get('enabled', False):
+                logger.info("="*60)
+                logger.info("智能查詢路由 (Query Routing)")
+                logger.info("="*60)
+                
+                routing_start = time.time()
+                routing_decision = self.query_router.route(query)
+                result['timings']['query_routing'] = time.time() - routing_start
+                result['routing'] = routing_decision
+                
+                logger.info(f"📍 路由決策: {routing_decision['route'].upper()}")
+                logger.info(f"📊 信心度: {routing_decision['confidence']:.2f}")
+                logger.info(f"💭 理由: {routing_decision['reasoning']}")
+                
+                # 根據路由決策，設置 Graph-first 或跳過 Graph
+                routing_confidence_threshold = self.config['query_routing'].get('confidence_threshold', 0.7)
+                
+                if routing_decision['confidence'] >= routing_confidence_threshold:
+                    if routing_decision['route'] == 'graph':
+                        # 跨論文查詢 → 優先使用 Graph
+                        logger.info("→ 使用 Graph-first 模式（跨論文結構化查詢）")
+                        result['preferred_route'] = 'graph'
+                        # 路由器覆蓋配置，確保 Graph 會執行
+                        result['skip_graph_for_this_query'] = False
+                        if self.graph_retriever and self.graph_integrator:
+                            logger.info("  ✓ Graph 檢索已就緒，將執行 Knowledge Graph 查詢")
+                        else:
+                            logger.warning("  ⚠️ Graph 組件未初始化，將回退到傳統 RAG 流程")
+                    else:  # rag
+                        # 單一論文詳細查詢 → 跳過 Graph，直接使用 RAG
+                        logger.info("→ 使用 RAG 模式（單一論文詳細內容檢索）")
+                        result['preferred_route'] = 'rag'
+                        # 暫時禁用 Graph-first（針對此查詢）
+                        result['skip_graph_for_this_query'] = True
+                else:
+                    logger.info(f"→ 信心度不足 ({routing_decision['confidence']:.2f} < {routing_confidence_threshold})，使用預設路由")
+                    default_route = self.config['query_routing'].get('default_route', 'rag')
+                    result['preferred_route'] = default_route
+                    result['skip_graph_for_this_query'] = (default_route == 'rag')
+            
             # ============================================================
             # STEP 0: Query Enhancement (Expansion + Weight Adjustment)
             # ============================================================
@@ -706,156 +822,305 @@ class HierarchicalRAGSystem:
             }
             
             # ============================================================
-            # LAYER 1: Paper-level retrieval
+            # GRAPH STAGE: Query Neo4j for papers (if enabled and routed)
             # ============================================================
-            logger.info("="*60)
-            logger.info("LAYER 1: Paper-level Retrieval")
-            logger.info("="*60)
+            # 檢查是否應該跳過 Graph（根據路由決策）
+            skip_graph = result.get('skip_graph_for_this_query', False)
             
-            layer1_start = time.time()
-            
-            if not self.layer1.is_initialized:
-                raise ValueError("Layer 1 index not initialized")
-            
-            k1 = self.config['layer1']['k_documents']
-            similarity_threshold = self.config['layer1'].get('similarity_threshold')
-            
-            # 判斷使用混合檢索還是純語義搜尋
-            # 先獲取所有結果（不使用 threshold 過濾），用於顯示
-            if self.hybrid_retriever and self.config.get('hybrid_search', {}).get('enabled', False):
-                # 使用混合檢索 (語義 + 關鍵詞) with adjusted weights
-                logger.info("使用混合檢索 (Hybrid Search: 語義 + 關鍵詞)")
-                logger.info(f"  當前權重: 語義={semantic_weight:.2f}, 關鍵詞={keyword_weight:.2f}")
+            if self.graph_retriever and self.graph_integrator and not skip_graph:
+                logger.info("="*60)
+                logger.info("GRAPH STAGE: Querying Knowledge Graph")
+                logger.info("="*60)
                 
-                # 先不使用 threshold，獲取所有結果
-                layer1_all_results = self.hybrid_retriever.hybrid_search(
+                graph_start = time.time()
+                
+                try:
+                    # Step 1: Query graph for papers
+                    graph_config = self.config.get('graph_first', {})
+                    graph_top_k = graph_config.get('graph_query_top_k', 15)
+                    
+                    graph_results = self.graph_retriever.query_graph_for_papers(
+                        query=query,
+                        top_k=graph_top_k
+                    )
+                    
+                    result['timings']['graph_query'] = time.time() - graph_start
+                    result['layers_used'].append('graph')
+                    result['graph_results'] = graph_results
+                    
+                    logger.info(f"Found {len(graph_results)} papers from Graph")
+                    
+                    # Display top results
+                    if graph_results:
+                        logger.info("\n📊 Graph 查詢結果 Top 5:")
+                        logger.info("─" * 80)
+                        for i, paper in enumerate(graph_results[:5], 1):
+                            paper_id = paper['paper_id']
+                            score = paper['score']
+                            entities = paper['matched_entities']
+                            logger.info(f"  {i}. [{score:.2f}] {paper_id[:50]}...")
+                            logger.info(f"      Matched entities: {', '.join(entities[:5])}")
+                        logger.info("─" * 80)
+                    
+                    # Check minimum hits threshold
+                    min_hits = graph_config.get('min_graph_hits', 1)
+                    
+                    if len(graph_results) >= min_hits:
+                        # Step 2: Integrate graph results using LLM
+                        integration_start = time.time()
+                        max_papers = graph_config.get('max_papers_for_integration', 5)
+                        
+                        integration = self.graph_integrator.integrate_graph_results(
+                            query=query,
+                            graph_results=graph_results,
+                            max_papers=max_papers
+                        )
+                        
+                        result['timings']['graph_integration'] = time.time() - integration_start
+                        result['graph_integration'] = integration
+                        
+                        logger.info(f"\nGraph Integration:")
+                        logger.info(f"  Confidence: {integration['confidence']:.2f}")
+                        logger.info(f"  Should descend: {integration['should_descend']}")
+                        logger.info(f"  Missing info: {integration['missing_info']}")
+                        logger.info(f"  Answer preview: {integration['text'][:150]}...")
+                        
+                        # Step 3: Decision - should we descend to Layer2?
+                        graph_threshold = graph_config.get('confidence_threshold', 0.7)
+                        
+                        if not integration['should_descend']:
+                            logger.info(f"\n✓ Graph results sufficient (confidence: {integration['confidence']:.2f} >= {graph_threshold})")
+                            logger.info("  No detailed chunk retrieval needed")
+                            logger.info("  Terminating at Graph stage")
+                            
+                            result['final_docs'] = []  # No chunks retrieved
+                            result['final_answer'] = integration['text']
+                            result['final_confidence'] = integration['confidence']
+                            result['terminated_at'] = 'graph'
+                            result['referenced_papers'] = integration.get('referenced_papers', [])
+                            result['timings']['total'] = time.time() - start_time
+                            
+                            return result
+                        
+                        logger.info("\n→ Graph results insufficient, descending to Layer2 for details")
+                        
+                        # Step 4: Determine chunk types to retrieve
+                        chunk_types = self.graph_integrator.determine_chunk_types_for_query(
+                            query=query,
+                            missing_info=integration['missing_info']
+                        )
+                        
+                        result['target_chunk_types'] = chunk_types
+                        logger.info(f"  Target chunk types: {chunk_types}")
+                        
+                        # Step 5: Extract paper_ids for Layer2 filtering
+                        graph_paper_ids = [r['paper_id'] for r in graph_results]
+                        result['graph_paper_ids'] = graph_paper_ids
+                        
+                        logger.info(f"  Will filter {len(graph_paper_ids)} papers from Graph")
+                        
+                        # Skip Layer 1 if configured
+                        skip_layer1 = graph_config.get('skip_layer1', True)
+                        
+                        if skip_layer1:
+                            logger.info("\n  ⚡ Skipping Layer1 (Graph → Layer2 direct path)")
+                            
+                            # Jump directly to Layer 2 with filtering
+                            # We'll set layer1_docs to empty and paper_ids from graph
+                            # The Layer 2 code below will use graph_paper_ids
+                            result['layer1_skipped'] = True
+                            
+                            # Continue to Layer 2 (skip Layer 1 block)
+                            # We need to jump to Layer 2 section
+                            # Set up variables that Layer 2 expects
+                            layer1_docs = []  # No Layer1 docs
+                            paper_ids = graph_paper_ids  # Use Graph paper IDs
+                            
+                            # Skip the entire Layer 1 block below
+                            # Jump directly to Layer 2
+                            # (We'll handle this by setting a flag and checking it)
+                            
+                        else:
+                            logger.info("\n  → Continuing to Layer1 as backup")
+                            # Continue to Layer 1 normally
+                            result['layer1_skipped'] = False
+                    
+                    else:
+                        logger.warning(f"⚠️  Graph returned {len(graph_results)} papers (< min: {min_hits})")
+                        logger.warning("  Falling back to Layer1")
+                        result['graph_insufficient'] = True
+                
+                except Exception as e:
+                    logger.error(f"❌ Graph query failed: {e}", exc_info=True)
+                    logger.warning("  Falling back to Layer1")
+                    result['graph_error'] = str(e)
+            
+            # Check if we should skip Layer 1
+            skip_layer1 = result.get('layer1_skipped', False)
+            
+            if not skip_layer1:
+                # ============================================================
+                # LAYER 1: Paper-level retrieval
+                # ============================================================
+                logger.info("="*60)
+                logger.info("LAYER 1: Paper-level Retrieval")
+                logger.info("="*60)
+            
+                layer1_start = time.time()
+            
+                if not self.layer1.is_initialized:
+                    raise ValueError("Layer 1 index not initialized")
+            
+                k1 = self.config['layer1']['k_documents']
+                similarity_threshold = self.config['layer1'].get('similarity_threshold')
+            
+                # 判斷使用混合檢索還是純語義搜尋
+                # 先獲取所有結果（不使用 threshold 過濾），用於顯示
+                if self.hybrid_retriever and self.config.get('hybrid_search', {}).get('enabled', False):
+                    # 使用混合檢索 (語義 + 關鍵詞) with adjusted weights
+                    logger.info("使用混合檢索 (Hybrid Search: 語義 + 關鍵詞)")
+                    logger.info(f"  當前權重: 語義={semantic_weight:.2f}, 關鍵詞={keyword_weight:.2f}")
+                
+                    # 先不使用 threshold，獲取所有結果
+                    layer1_all_results = self.hybrid_retriever.hybrid_search(
+                        query=query,
+                        k=k1,
+                        semantic_weight=semantic_weight,
+                        keyword_weight=keyword_weight,
+                        score_threshold=None,  # 不過濾，顯示所有結果
+                        return_scores_breakdown=False
+                    )
+                
+                    # 再應用 threshold 過濾（用於後續處理）
+                    if similarity_threshold is not None:
+                        layer1_results_with_scores = [
+                            (doc, score) for doc, score in layer1_all_results 
+                            if score >= similarity_threshold
+                        ]
+                    else:
+                        layer1_results_with_scores = layer1_all_results
+                else:
+                    # 使用純語義搜尋
+                    logger.info("使用純語義搜尋 (Semantic Search)")
+                
+                    # 先不使用 threshold
+                    layer1_all_results = self.layer1.search_with_scores(
+                        query=query, 
+                        k=k1,
+                        score_threshold=None
+                    )
+                
+                    # 再應用 threshold 過濾
+                    if similarity_threshold is not None:
+                        layer1_results_with_scores = [
+                            (doc, score) for doc, score in layer1_all_results 
+                            if score >= similarity_threshold
+                        ]
+                    else:
+                        layer1_results_with_scores = layer1_all_results
+            
+                # 提取文檔（用於後續處理）
+                layer1_docs = [doc for doc, score in layer1_results_with_scores]
+            
+                result['timings']['layer1_retrieval'] = time.time() - layer1_start
+                result['layers_used'].append('layer1')
+            
+                # 保存 Layer1 文檔和分數
+                result['layer1_docs'] = layer1_docs
+                result['layer1_scores'] = [score for doc, score in layer1_results_with_scores]
+            
+                # 總是顯示前 5 名相似度最高的論文（從所有結果中）
+                logger.info("\n📊 Layer 1 前 5 名相似度最高的論文:")
+                logger.info("─" * 80)
+                if layer1_all_results:
+                    for i, (doc, score) in enumerate(layer1_all_results[:5], 1):
+                        title = doc.metadata.get('title', 'Unknown')
+                        # 標記是否通過 threshold
+                        passed = "✓" if similarity_threshold is None or score >= similarity_threshold else "✗"
+                        logger.info(f"  {i}. [{score:.4f}] {passed} {title}")
+                
+                    if similarity_threshold is not None:
+                        passed_count = len(layer1_results_with_scores)
+                        total_count = len(layer1_all_results)
+                        logger.info(f"\n  通過閾值 ({similarity_threshold:.2f}): {passed_count}/{total_count} 篇")
+                else:
+                    logger.warning("  ⚠️  沒有找到任何論文")
+                logger.info("─" * 80)
+            
+                logger.info(f"\nRetrieved {len(layer1_docs)} papers"
+                           f"{f' (threshold: {similarity_threshold:.2f})' if similarity_threshold else ''}")
+                
+                if not layer1_docs:
+                    logger.warning("No relevant papers found in Layer 1")
+                    result['status'] = 'no_results'
+                    result['message'] = 'No relevant papers found matching your query.'
+                    result['timings']['total'] = time.time() - start_time
+                    return result
+                
+                # Evaluate Layer 1 results
+                eval1_start = time.time()
+                threshold1 = self.config['layer1']['confidence_threshold']
+                
+                evaluation1 = self.confidence_evaluator.evaluate(
                     query=query,
-                    k=k1,
-                    semantic_weight=semantic_weight,
-                    keyword_weight=keyword_weight,
-                    score_threshold=None,  # 不過濾，顯示所有結果
-                    return_scores_breakdown=False
+                    retrieved_docs=layer1_docs,
+                    layer=1,
+                    threshold=threshold1
                 )
                 
-                # 再應用 threshold 過濾（用於後續處理）
-                if similarity_threshold is not None:
-                    layer1_results_with_scores = [
-                        (doc, score) for doc, score in layer1_all_results 
-                        if score >= similarity_threshold
-                    ]
-                else:
-                    layer1_results_with_scores = layer1_all_results
-            else:
-                # 使用純語義搜尋
-                logger.info("使用純語義搜尋 (Semantic Search)")
+                result['timings']['layer1_evaluation'] = time.time() - eval1_start
+                result['evaluations']['layer1'] = evaluation1
                 
-                # 先不使用 threshold
-                layer1_all_results = self.layer1.search_with_scores(
-                    query=query, 
-                    k=k1,
-                    score_threshold=None
+                logger.info(f"Layer 1 Evaluation:")
+                logger.info(f"  Confidence: {evaluation1['confidence']:.2f} (threshold: {threshold1})")
+                logger.info(f"  Should continue: {evaluation1['should_continue']}")
+                logger.info(f"  Reasoning: {evaluation1['reasoning'][:100]}...")
+                
+                # ========== 使用智能觸發決策器 ==========
+                logger.info("\n" + "="*60)
+                logger.info("Layer 2 觸發決策分析")
+                logger.info("="*60)
+                
+                trigger_decision = self.layer2_trigger.should_trigger_layer2(
+                    query=query,
+                    layer1_evaluation=evaluation1,
+                    layer1_docs=layer1_docs,
+                    base_threshold=threshold1
                 )
                 
-                # 再應用 threshold 過濾
-                if similarity_threshold is not None:
-                    layer1_results_with_scores = [
-                        (doc, score) for doc, score in layer1_all_results 
-                        if score >= similarity_threshold
-                    ]
-                else:
-                    layer1_results_with_scores = layer1_all_results
-            
-            # 提取文檔（用於後續處理）
-            layer1_docs = [doc for doc, score in layer1_results_with_scores]
-            
-            result['timings']['layer1_retrieval'] = time.time() - layer1_start
-            result['layers_used'].append('layer1')
-            
-            # 保存 Layer1 文檔和分數
-            result['layer1_docs'] = layer1_docs
-            result['layer1_scores'] = [score for doc, score in layer1_results_with_scores]
-            
-            # 總是顯示前 5 名相似度最高的論文（從所有結果中）
-            logger.info("\n📊 Layer 1 前 5 名相似度最高的論文:")
-            logger.info("─" * 80)
-            if layer1_all_results:
-                for i, (doc, score) in enumerate(layer1_all_results[:5], 1):
-                    title = doc.metadata.get('title', 'Unknown')
-                    # 標記是否通過 threshold
-                    passed = "✓" if similarity_threshold is None or score >= similarity_threshold else "✗"
-                    logger.info(f"  {i}. [{score:.4f}] {passed} {title}")
+                logger.info(f"決策結果:")
+                logger.info(f"  是否觸發 Layer 2: {trigger_decision['should_trigger']}")
+                logger.info(f"  查詢類型: {trigger_decision['decision_factors']['query_type']}")
+                logger.info(f"  查詢複雜度: {trigger_decision['decision_factors']['query_complexity']}")
+                logger.info(f"  基礎閾值: {trigger_decision['decision_factors']['base_threshold']:.2f}")
+                logger.info(f"  調整後閾值: {trigger_decision['adjusted_threshold']:.2f}")
+                logger.info(f"  決策理由: {trigger_decision['reason']}")
                 
-                if similarity_threshold is not None:
-                    passed_count = len(layer1_results_with_scores)
-                    total_count = len(layer1_all_results)
-                    logger.info(f"\n  通過閾值 ({similarity_threshold:.2f}): {passed_count}/{total_count} 篇")
+                # 記錄決策資訊
+                result['layer2_trigger_decision'] = trigger_decision
+                
+                # 根據智能決策判斷是否進入 Layer 2
+                if not trigger_decision['should_trigger']:
+                    logger.info("✓ 智能決策: Layer 1 結果已足夠，無需進入 Layer 2")
+                    result['final_docs'] = layer1_docs
+                    result['final_confidence'] = evaluation1['confidence'] if evaluation1 else 0.0
+                    result['terminated_at'] = 'layer1'
+                    result['termination_reason'] = trigger_decision['reason']
+                    result['timings']['total'] = time.time() - start_time
+                    return result
+                
+                logger.info("→ 智能決策: 需要進入 Layer 2 獲取更詳細資訊")
+            
             else:
-                logger.warning("  ⚠️  沒有找到任何論文")
-            logger.info("─" * 80)
-            
-            logger.info(f"\nRetrieved {len(layer1_docs)} papers"
-                       f"{f' (threshold: {similarity_threshold:.2f})' if similarity_threshold else ''}")
-            
-            if not layer1_docs:
-                logger.warning("No relevant papers found in Layer 1")
-                result['status'] = 'no_results'
-                result['message'] = 'No relevant papers found matching your query.'
-                result['timings']['total'] = time.time() - start_time
-                return result
-            
-            # Evaluate Layer 1 results
-            eval1_start = time.time()
-            threshold1 = self.config['layer1']['confidence_threshold']
-            
-            evaluation1 = self.confidence_evaluator.evaluate(
-                query=query,
-                retrieved_docs=layer1_docs,
-                layer=1,
-                threshold=threshold1
-            )
-            
-            result['timings']['layer1_evaluation'] = time.time() - eval1_start
-            result['evaluations']['layer1'] = evaluation1
-            
-            logger.info(f"Layer 1 Evaluation:")
-            logger.info(f"  Confidence: {evaluation1['confidence']:.2f} (threshold: {threshold1})")
-            logger.info(f"  Should continue: {evaluation1['should_continue']}")
-            logger.info(f"  Reasoning: {evaluation1['reasoning'][:100]}...")
-            
-            # ========== 使用智能觸發決策器 ==========
-            logger.info("\n" + "="*60)
-            logger.info("Layer 2 觸發決策分析")
-            logger.info("="*60)
-            
-            trigger_decision = self.layer2_trigger.should_trigger_layer2(
-                query=query,
-                layer1_evaluation=evaluation1,
-                layer1_docs=layer1_docs,
-                base_threshold=threshold1
-            )
-            
-            logger.info(f"決策結果:")
-            logger.info(f"  是否觸發 Layer 2: {trigger_decision['should_trigger']}")
-            logger.info(f"  查詢類型: {trigger_decision['decision_factors']['query_type']}")
-            logger.info(f"  查詢複雜度: {trigger_decision['decision_factors']['query_complexity']}")
-            logger.info(f"  基礎閾值: {trigger_decision['decision_factors']['base_threshold']:.2f}")
-            logger.info(f"  調整後閾值: {trigger_decision['adjusted_threshold']:.2f}")
-            logger.info(f"  決策理由: {trigger_decision['reason']}")
-            
-            # 記錄決策資訊
-            result['layer2_trigger_decision'] = trigger_decision
-            
-            # 根據智能決策判斷是否進入 Layer 2
-            if not trigger_decision['should_trigger']:
-                logger.info("✓ 智能決策: Layer 1 結果已足夠，無需進入 Layer 2")
-                result['final_docs'] = layer1_docs
-                result['final_confidence'] = evaluation1['confidence']
-                result['terminated_at'] = 'layer1'
-                result['termination_reason'] = trigger_decision['reason']
-                result['timings']['total'] = time.time() - start_time
-                return result
-            
-            logger.info("→ 智能決策: 需要進入 Layer 2 獲取更詳細資訊")
+                # Layer1 was skipped (Graph-first direct path)
+                logger.info("\n" + "="*60)
+                logger.info("Layer1 skipped - using Graph results for paper filtering")
+                logger.info("="*60)
+                
+                # No Layer1 evaluation when skipped, set defaults
+                layer1_docs = []  # Empty for consistency
+                evaluation1 = None  # Mark as not evaluated
+                trigger_decision = {'should_trigger': True}  # Always proceed to Layer2
             
             # ============================================================
             # LAYER 2: Chunk-level retrieval
@@ -869,9 +1134,26 @@ class HierarchicalRAGSystem:
             if not self.layer2.is_initialized:
                 raise ValueError("Layer 2 index not initialized")
             
-            # Extract paper IDs from Layer 1 results
-            paper_ids = [doc.metadata['paper_id'] for doc in layer1_docs]
-            logger.info(f"Filtering by {len(paper_ids)} papers from Layer 1")
+            # Determine paper IDs source (Graph or Layer1)
+            if result.get('layer1_skipped', False):
+                # Use paper IDs from Graph
+                paper_ids = result.get('graph_paper_ids', [])
+                logger.info(f"Filtering by {len(paper_ids)} papers from Graph")
+                logger.info(f"  Source: Graph-first direct path")
+            else:
+                # Use paper IDs from Layer 1
+                paper_ids = [doc.metadata['paper_id'] for doc in layer1_docs]
+                logger.info(f"Filtering by {len(paper_ids)} papers from Layer 1")
+                logger.info(f"  Source: Traditional Layer1 → Layer2 path")
+            
+            # Get chunk type filter (if determined by Graph)
+            filter_chunk_types = result.get('target_chunk_types', None)
+            
+            if filter_chunk_types:
+                logger.info(f"📌 Applying chunk type filter: {filter_chunk_types}")
+                logger.info(f"  Will only retrieve chunks of these semantic types")
+            else:
+                logger.info(f"  No chunk type filtering (retrieving all types)")
             
             # Strategy: Retrieve top-2 chunks PER PAPER (not globally)
             CHUNKS_PER_PAPER = 2
@@ -885,7 +1167,8 @@ class HierarchicalRAGSystem:
                 paper_results = self.layer2.search_with_scores(
                     query=query,
                     k=CHUNKS_PER_PAPER,
-                    filter_paper_ids=[paper_id]
+                    filter_paper_ids=[paper_id],
+                    filter_chunk_types=filter_chunk_types  # NEW: Apply chunk type filter
                 )
                 
                 if paper_results:
@@ -898,7 +1181,8 @@ class HierarchicalRAGSystem:
             layer2_docs = [doc for doc, score in all_layer2_results]
             
             # For overview/general queries, ensure abstract chunks are included
-            query_type = trigger_decision['decision_factors']['query_type']
+            # (Only applicable when trigger_decision has decision_factors)
+            query_type = trigger_decision.get('decision_factors', {}).get('query_type', 'specific')
             if query_type in ['overview', 'general']:
                 logger.info("🔍 Overview query detected - ensuring abstract chunks are included")
                 logger.info(f"  Paper IDs to check: {paper_ids}")
@@ -971,7 +1255,8 @@ class HierarchicalRAGSystem:
             if not layer2_docs:
                 logger.warning("No chunks found in Layer 2, using Layer 1 results")
                 result['final_docs'] = layer1_docs
-                result['final_confidence'] = evaluation1['confidence']
+                # Safe access to evaluation1 (may be None if Layer1 was skipped)
+                result['final_confidence'] = evaluation1['confidence'] if evaluation1 else 0.0
                 result['terminated_at'] = 'layer1_fallback'
                 result['timings']['total'] = time.time() - start_time
                 return result
@@ -993,6 +1278,17 @@ class HierarchicalRAGSystem:
             logger.info(f"Layer 2 Evaluation:")
             logger.info(f"  Confidence: {evaluation2['confidence']:.2f} (threshold: {threshold2})")
             logger.info(f"  Reasoning: {evaluation2['reasoning'][:100]}...")
+            
+            # ============================================================
+            # DYNAMIC ENTITY EXTRACTION is disabled (rollback)
+            # ============================================================
+            # The dynamic, query-time entity extractor was removed per user request.
+            # We keep a placeholder in the result for compatibility with callers.
+            logger.info("\n" + "="*60)
+            logger.info("DYNAMIC ENTITY EXTRACTION: disabled")
+            logger.info("="*60)
+            result['timings']['entity_extraction'] = 0.0
+            result['entity_extraction'] = {'status': 'disabled', 'entities': [], 'relationships': []}
             
             # ============================================================
             # CONTEXT EXPANSION (Per Paper)

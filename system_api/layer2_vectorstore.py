@@ -49,7 +49,7 @@ class Layer2VectorStore:
             cache_size: 快取大小（保留以兼容）
             use_reranker: 是否使用 re-ranker（強制 True）
             reranker_config: Re-ranker 配置
-            chunking_config: Chunking configuration (NEW: supports 'naive' or 'summarization' mode)
+            chunking_config: Chunking configuration (DEPRECATED: only summarization mode supported)
         """
         self.embeddings = embeddings  # 保留以兼容
         self.vectorstore_path = vectorstore_path
@@ -57,9 +57,9 @@ class Layer2VectorStore:
         self.chunk_overlap = chunk_overlap
         self.use_reranker = True  # 強制啟用
         
-        # Parse chunking config
+        # Parse chunking config - ONLY summarization mode supported
         self.chunking_config = chunking_config or {}
-        self.chunking_mode = self.chunking_config.get('mode', 'naive')  # Default: naive (backward compatible)
+        self.chunking_mode = 'summarization'  # Fixed: only summarization mode
         
         # 文件路徑
         self.jsonl_file = os.path.join(vectorstore_path, "chunks.jsonl")
@@ -82,17 +82,16 @@ class Layer2VectorStore:
         self._document_store = None
         self._reranker_config = reranker_config or {}
         
-        # Summarization components (if enabled)
+        # Summarization components (always enabled)
         self.section_parser = None
         self.summarizer = None
-        if self.chunking_mode == 'summarization':
-            self._init_summarization_components()
+        self._init_summarization_components()
         
         # 初始化
         os.makedirs(vectorstore_path, exist_ok=True)
         self._init_reranking_components()
         
-        logger.info(f"✓ Layer 2 VectorStore initialized (chunking_mode={self.chunking_mode})")
+        logger.info(f"✓ Layer 2 VectorStore initialized (chunking_mode=summarization)")
     
     def _init_reranking_components(self):
         """初始化 Cross-Encoder re-ranker 和 document store"""
@@ -161,8 +160,7 @@ class Layer2VectorStore:
             
         except Exception as e:
             logger.error(f"Failed to initialize summarization components: {e}", exc_info=True)
-            logger.warning("Falling back to naive chunking mode")
-            self.chunking_mode = 'naive'
+            raise RuntimeError("Summarization components are required but failed to initialize")
     
     def _update_statistics(self):
         """更新 chunk 和 paper 統計"""
@@ -213,7 +211,7 @@ class Layer2VectorStore:
         """
         建構索引（存儲所有 chunks 到 JSONL）
         
-        Dispatches to either naive or summarization mode based on config.
+        Uses summarization mode only.
         
         Args:
             documents: 文檔列表（每個 document 是一個 chunk）
@@ -221,60 +219,7 @@ class Layer2VectorStore:
         Returns:
             True if successful
         """
-        if self.chunking_mode == 'summarization':
-            return self._build_index_with_summarization(documents)
-        else:
-            return self._build_index_naive(documents)
-    
-    def _build_index_naive(self, documents: List[Document]) -> bool:
-        """
-        Build index using naive chunking (original behavior)
-        
-        Args:
-            documents: Document list (each is a chunk)
-            
-        Returns:
-            True if successful
-        """
-        try:
-            if not documents:
-                logger.warning("No documents provided to build index")
-                return False
-            
-            logger.info(f"Building Layer 2 index (naive mode) with {len(documents)} chunks...")
-            start_time = time.time()
-            
-            # 驗證
-            valid_docs = []
-            for doc in documents:
-                if not doc.page_content or len(doc.page_content) < 50:
-                    logger.warning(f"Skipping chunk - content too short")
-                    continue
-                if 'paper_id' not in doc.metadata:
-                    logger.warning(f"Skipping chunk - missing paper_id")
-                    continue
-                valid_docs.append(doc)
-            
-            if not valid_docs:
-                logger.error("No valid documents after validation")
-                return False
-            
-            # 存儲到 JSONL
-            success = self._document_store.store_chunks(valid_docs)
-            
-            if success:
-                self._update_statistics()
-                elapsed = time.time() - start_time
-                logger.info(f"✓ Index built in {elapsed:.2f}s")
-                logger.info(f"  Chunks: {self._chunk_count}, Papers: {self._paper_count}")
-                return True
-            else:
-                logger.error("Failed to store chunks")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Failed to build index (naive): {e}", exc_info=True)
-            return False
+        return self._build_index_with_summarization(documents)
     
     def _build_index_with_summarization(self, documents: List[Document]) -> bool:
         """
@@ -552,6 +497,7 @@ class Layer2VectorStore:
         query: str,
         k: int = 10,
         filter_paper_ids: Optional[List[str]] = None,
+        filter_chunk_types: Optional[List[str]] = None,  # NEW: Filter by chunk type
         paper_ids: Optional[List[str]] = None  # 向後兼容
     ) -> List[Document]:
         """
@@ -561,6 +507,7 @@ class Layer2VectorStore:
             query: 查詢文本
             k: 返回結果數量
             filter_paper_ids: 過濾的 paper IDs（None = 搜索全部）
+            filter_chunk_types: 過濾的 chunk 類型（例如 ['method', 'experiment']）
             paper_ids: 別名，向後兼容
             
         Returns:
@@ -568,7 +515,7 @@ class Layer2VectorStore:
         """
         # 向後兼容：如果提供了 paper_ids，使用它
         filter_ids = filter_paper_ids if filter_paper_ids is not None else paper_ids
-        results = self.search_with_scores(query, k, filter_ids)
+        results = self.search_with_scores(query, k, filter_ids, filter_chunk_types)
         return [doc for doc, score in results]
     
     def search_with_scores(
@@ -576,6 +523,7 @@ class Layer2VectorStore:
         query: str,
         k: int = 10,
         filter_paper_ids: Optional[List[str]] = None,
+        filter_chunk_types: Optional[List[str]] = None,  # NEW: Filter by chunk type
         paper_ids: Optional[List[str]] = None  # 向後兼容
     ) -> List[Tuple[Document, float]]:
         """
@@ -585,6 +533,7 @@ class Layer2VectorStore:
             query: 查詢文本
             k: 返回結果數量
             filter_paper_ids: 過濾的 paper IDs（None = 搜索全部）
+            filter_chunk_types: 過濾的 chunk 類型（例如 ['method', 'experiment']）
             paper_ids: 別名，向後兼容
             
         Returns:
@@ -601,6 +550,19 @@ class Layer2VectorStore:
             if not candidate_chunks:
                 logger.warning(f"No chunks found for papers: {filter_ids}")
                 return []
+            
+            # NEW: Filter by chunk_types if specified
+            if filter_chunk_types:
+                original_count = len(candidate_chunks)
+                candidate_chunks = [
+                    chunk for chunk in candidate_chunks
+                    if chunk.get('metadata', {}).get('chunk_type') in filter_chunk_types
+                ]
+                logger.info(f"Filtered by chunk_types {filter_chunk_types}: {original_count} → {len(candidate_chunks)} chunks")
+                
+                if not candidate_chunks:
+                    logger.warning(f"No chunks of types {filter_chunk_types} found")
+                    return []
             
             # 限制候選數量以避免太慢
             max_candidates = self._reranker_config.get('max_candidates', 300)
