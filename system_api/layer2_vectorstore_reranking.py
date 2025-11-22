@@ -253,7 +253,8 @@ class Layer2VectorStore:
         self,
         query: str,
         k: int = 10,
-        paper_ids: Optional[List[str]] = None
+        paper_ids: Optional[List[str]] = None,
+        filter_chunk_types: Optional[List[str]] = None
     ) -> List[Document]:
         """
         搜索相關 chunks（使用 re-ranking）
@@ -262,18 +263,20 @@ class Layer2VectorStore:
             query: 查詢文本
             k: 返回結果數量
             paper_ids: 過濾的 paper IDs（None = 搜索全部）
+            filter_chunk_types: 過濾的 chunk 類型列表（None = 不過濾）
             
         Returns:
             相關文檔列表
         """
-        results = self.search_with_scores(query, k, paper_ids)
+        results = self.search_with_scores(query, k, paper_ids, filter_chunk_types)
         return [doc for doc, score in results]
     
     def search_with_scores(
         self,
         query: str,
         k: int = 10,
-        paper_ids: Optional[List[str]] = None
+        paper_ids: Optional[List[str]] = None,
+        filter_chunk_types: Optional[List[str]] = None
     ) -> List[Tuple[Document, float]]:
         """
         搜索相關 chunks 並返回分數
@@ -282,6 +285,8 @@ class Layer2VectorStore:
             query: 查詢文本
             k: 返回結果數量
             paper_ids: 過濾的 paper IDs（None = 搜索全部）
+            filter_chunk_types: 過濾的 chunk 類型列表（None = 不過濾）
+                               例如: ['methods', 'results', 'dataset']
             
         Returns:
             (Document, score) 列表，按分數降序排列
@@ -295,6 +300,27 @@ class Layer2VectorStore:
             if not candidate_chunks:
                 logger.warning(f"No chunks found for papers: {paper_ids}")
                 return []
+            
+            # Apply chunk type/section filtering if specified
+            if filter_chunk_types:
+                original_count = len(candidate_chunks)
+                
+                # Filter by both chunk_type and section_name for flexibility
+                # This supports both semantic chunk types and section-based chunking
+                candidate_chunks = [
+                    chunk for chunk in candidate_chunks
+                    if (chunk.get('metadata', {}).get('chunk_type') in filter_chunk_types or
+                        chunk.get('metadata', {}).get('section_name') in filter_chunk_types)
+                ]
+                
+                logger.info(f"Filtered by chunk_types {filter_chunk_types}: {original_count} → {len(candidate_chunks)} chunks")
+                
+                if not candidate_chunks:
+                    logger.warning(f"No chunks of types {filter_chunk_types} found")
+                    # Don't return empty - let it fall through to retrieve all chunks
+                    # This provides a fallback when filtering is too restrictive
+                    candidate_chunks = self._document_store.get_chunks_by_paper_ids(paper_ids)
+                    logger.info(f"Fallback: retrieving all {len(candidate_chunks)} chunks without type filtering")
             
             # 限制候選數量以避免太慢
             max_candidates = self._reranker_config.get('max_candidates', 300)

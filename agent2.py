@@ -420,15 +420,25 @@ Final Answer: the final answer to the original input question
 
 IMPORTANT ROUTING RULES:
 
-1. **GraphAnalysisCall** (Macro-View):
-   - USE WHEN: User asks "Which papers...", "List all...", "How many...", "Compare...", "What are the common methods...".
-   - KEYWORDS: Methods, Datasets, Domain, Metrics, Relationship, Trends, Count.
-   - Examples: "Which papers use LSTM?", "List all datasets", "How many papers in Smart Transportation?"
+1. **AssistantCall** (Single Paper Detail Query):
+   - USE WHEN: User asks about content/details of ONE SPECIFIC paper.
+   - KEYWORDS: "this paper", "the paper about X", specific paper title, "what does paper X say", "explain X in paper", "methodology", "results", "dataset used in paper".
+   - Examples: 
+     * "Summarize the paper about traffic flow prediction"
+     * "What methods does the LSTM paper use?"
+     * "Tell me about the dataset in the mango classification paper"
+     * "這篇關於交通流量預測的論文用什麼方法？"
+   - NOTE: AssistantCall will identify the specific paper, check if abstract is sufficient, then retrieve detailed chunks if needed.
 
-2. **AssistantCall** (Micro-View):
-   - USE WHEN: User asks about content/details of a specific paper or wants summaries.
-   - KEYWORDS: Summarize, Explain, Abstract, Introduction, Methodology, Content.
-   - Examples: "Summarize this paper", "Explain the methodology in paper X"
+2. **GraphAnalysisCall** (Cross-Paper Query):
+   - USE WHEN: User asks about MULTIPLE papers, comparisons, or aggregations across papers.
+   - KEYWORDS: "Which papers...", "List all...", "How many...", "Compare...", "What are the common methods...", "papers that use X".
+   - Examples: 
+     * "Which papers use LSTM?"
+     * "List all datasets"
+     * "How many papers in Smart Transportation?"
+     * "Compare research goals across papers"
+     * "哪些論文用到集成式學習？"
 
 3. **WebSearchCall**:
    - USE ONLY for explicit internet search requests.
@@ -436,78 +446,70 @@ IMPORTANT ROUTING RULES:
 
 Here are some examples (FOLLOW THESE FORMATS EXACTLY):
 
-Example 1 - Macro Query (Use GraphAnalysisCall):
-Question: Which papers use LSTM?
-Thought: This asks for papers by method. This is a macro-level query across papers.
-Action: GraphAnalysisCall
-Action Input: Which papers use LSTM?
-Observation: [list of papers using LSTM from graph]
-Thought: I now know the final answer
-Final Answer: Papers using LSTM include...
-
-Example 2 - Chinese Macro Query (Use GraphAnalysisCall):
-Question: 哪些論文用到集成式學習？
-Thought: This asks "which papers" use ensemble learning. Macro-level query.
-Action: GraphAnalysisCall
-Action Input: 哪些論文用到集成式學習？
-Observation: [list of papers from graph]
-Thought: I now know the final answer
-Final Answer: 使用集成式學習的論文包括...
-
-Example 3 - Multi-Part Query (GraphAnalysisCall handles BOTH automatically):
-Question: 哪些論文用到集成式學習，細節又是什麼？
-Thought: This asks "which papers" (macro) AND "details" (micro). GraphAnalysisCall will automatically handle BOTH: it queries the Knowledge Graph, and if details are needed, it descends to Layer2 for chunk-level information.
-Action: GraphAnalysisCall
-Action Input: 哪些論文用到集成式學習，細節又是什麼？
-Observation: [Graph Analysis Result]
-使用集成式學習的論文包括「基礎5_應用集成式深度學習模型進行芒果分類辨識」。
-
-細節如下：
-- 方法: 使用 Mask R-CNN 和卷積神經網路進行影像分類
-- 訓練參數: batch_size=32, learning_rate=0.001
-- 結果: 準確率達到 95.3%
-
-[✓ Answer from Knowledge Graph → Layer2 - included detailed chunks]
-Thought: GraphAnalysisCall automatically retrieved both the paper list from Graph AND the details from Layer2. I now have the complete answer.
-Final Answer: 使用集成式學習的論文包括「基礎5_應用集成式深度學習模型進行芒果分類辨識」。此論文使用 Mask R-CNN 和卷積神經網路進行芒果分類，訓練參數為 batch_size=32, learning_rate=0.001，準確率達到 95.3%。
-
-Example 4 - Count Query (Use GraphAnalysisCall):
-Question: How many papers use the PeMSD7 dataset?
-Thought: This asks for a count across papers. This is a macro-level aggregation query.
-Action: GraphAnalysisCall
-Action Input: How many papers use the PeMSD7 dataset?
-Observation: [count from graph]
-Thought: I now know the final answer
-Final Answer: X papers use the PeMSD7 dataset.
-
-Example 4 - Comparison Query (Use GraphAnalysisCall):
-Question: Compare research goals in Smart Transportation domain
-Thought: This asks to compare across multiple papers. This is a macro-level query.
-Action: GraphAnalysisCall
-Action Input: Compare research goals in Smart Transportation domain
-Observation: [comparison from graph]
-Thought: I now know the final answer
-Final Answer: Research goals in Smart Transportation include...
-
-Example 5 - Specific Paper Summary (Use AssistantCall):
+Example 1 - Single Paper Query (Use AssistantCall):
 Question: Summarize the paper about traffic flow prediction
-Thought: This asks for content from a specific paper. This is a micro-level query.
+Thought: This asks for content from a SPECIFIC paper. This is a single-paper detail query.
 Action: AssistantCall
 Action Input: Summarize the paper about traffic flow prediction
-Observation: [summary from vector database]
+Observation: [Paper identified: "Paper123_Traffic_Flow". Abstract provides overview. Retrieving detailed chunks...]
 Thought: I now know the final answer
-Final Answer: The paper discusses...
+Final Answer: The paper on traffic flow prediction uses LSTM networks to predict traffic patterns. It employs the PeMSD7 dataset and achieves 92% accuracy...
 
-Example 6 - Content Explanation (Use AssistantCall):
-Question: Explain the methodology in the first paper
-Thought: This asks for detailed content. This is a micro-level query.
+Example 2 - Single Paper Detail Query (Use AssistantCall):
+Question: 芒果分類那篇論文用什麼方法？
+Thought: This asks for methods in a SPECIFIC paper about mango classification. Single-paper query.
 Action: AssistantCall
-Action Input: Explain the methodology in the first paper
-Observation: [methodology details from vector database]
+Action Input: 芒果分類那篇論文用什麼方法？
+Observation: [Paper: "基礎5_應用集成式深度學習模型進行芒果分類辨識". Methods: Mask R-CNN, CNN...]
 Thought: I now know the final answer
-Final Answer: The methodology includes...
+Final Answer: 芒果分類論文使用 Mask R-CNN 和卷積神經網路進行影像分類，訓練參數為 batch_size=32...
 
-Example 7 - Web Search (Use WebSearchCall):
+Example 3 - Single Paper Dataset Query (Use AssistantCall):
+Question: What dataset does the LSTM paper use?
+Thought: This asks about dataset in a SPECIFIC paper (LSTM paper). Single-paper query.
+Action: AssistantCall
+Action Input: What dataset does the LSTM paper use?
+Observation: [Paper identified. Dataset chunks retrieved: PeMSD7, training size 10000 samples...]
+Thought: I now know the final answer
+Final Answer: The LSTM paper uses the PeMSD7 dataset with 10,000 training samples...
+
+Example 4 - Cross-Paper Query (Use GraphAnalysisCall):
+Question: Which papers use LSTM?
+Thought: This asks "which papers" use LSTM. This is a cross-paper query.
+Action: GraphAnalysisCall
+Action Input: Which papers use LSTM?
+Observation: [Knowledge Graph results: Paper1, Paper2, Paper5 use LSTM...]
+Thought: I now know the final answer
+Final Answer: Papers using LSTM include: 1) Traffic Flow Prediction (Paper1), 2) Time Series Analysis (Paper2)...
+
+Example 5 - Cross-Paper Aggregation (Use GraphAnalysisCall):
+Question: 哪些論文用到集成式學習？
+Thought: This asks "which papers" use ensemble learning. Cross-paper aggregation query.
+Action: GraphAnalysisCall
+Action Input: 哪些論文用到集成式學習？
+Observation: [Knowledge Graph: 基礎5_芒果分類, 論文8_農業AI...]
+Thought: I now know the final answer
+Final Answer: 使用集成式學習的論文包括：1) 基礎5_芒果分類 2) 論文8_農業AI...
+
+Example 6 - Cross-Paper Comparison (Use GraphAnalysisCall):
+Question: Compare research goals in Smart Transportation domain
+Thought: This asks to compare across multiple papers. Cross-paper comparison query.
+Action: GraphAnalysisCall
+Action Input: Compare research goals in Smart Transportation domain
+Observation: [Knowledge Graph comparison results...]
+Thought: I now know the final answer
+Final Answer: Research goals in Smart Transportation include: Traffic prediction (3 papers), Route optimization (2 papers)...
+
+Example 7 - Count Query (Use GraphAnalysisCall):
+Question: How many papers use the PeMSD7 dataset?
+Thought: This asks for a count across papers. Cross-paper aggregation.
+Action: GraphAnalysisCall
+Action Input: How many papers use the PeMSD7 dataset?
+Observation: [Knowledge Graph count: 5 papers]
+Thought: I now know the final answer
+Final Answer: 5 papers use the PeMSD7 dataset.
+
+Example 8 - Web Search (Use WebSearchCall):
 Question: Search the internet for latest LSTM papers
 Thought: User explicitly said "search the internet".
 Action: WebSearchCall
@@ -698,7 +700,8 @@ def query_stream():
                                     yield f"data: {json.dumps({'type': 'tool_start', 'tool': 'AssistantCall'})}\n\n"
                                     
                                     action_input = event.get('input', user_input)
-                                    rag_stream = rag_system.query_stream(action_input)
+                                    # Use single paper query mode for AssistantCall
+                                    rag_stream = rag_system.query_single_paper_stream(action_input)
                                     
                                     chunk_count = 0
                                     for chunk in rag_stream:

@@ -282,78 +282,68 @@ JSON:"""
         missing_info: List[str]
     ) -> List[str]:
         """
-        根據查詢和缺失資訊，決定應該檢索哪些 chunk 類型
-        對應 GraphRAG 實體類型: background, method, dataset, metric, domain, results
+        根據查詢和缺失資訊，決定應該檢索哪些 section names
+        
+        注意：此方法現在返回 section names（如 "Method", "Results"）而非抽象的 chunk types，
+        以適應基於 section_summary 的 chunking 模式
         
         Args:
             query: 用戶查詢
             missing_info: 缺失的資訊類型
             
         Returns:
-            List of chunk types to search (e.g., ['method', 'dataset'])
+            List of section names to search (e.g., ['Method', 'Results', 'Dataset'])
         """
         query_lower = query.lower()
-        chunk_types = set()
+        section_names = set()
         
-        # 根據查詢關鍵詞映射到新的分類
-        # Dataset queries → dataset chunks
-        if any(kw in query_lower for kw in ['dataset', '資料集', '數據集', 'corpus', 'benchmark', '語料']):
-            chunk_types.add('dataset')
+        # 根據查詢關鍵詞映射到論文 section names（基於實際 JSONL 中的命名）
+        # Dataset queries → Dataset section (實際存在的 section)
+        if any(kw in query_lower for kw in ['dataset', '資料集', '數據集', 'corpus', 'benchmark', '語料', 'data']):
+            section_names.update(['Dataset', 'Methodology'])  # Dataset section 存在，Methodology 通常也包含數據描述
         
-        # Method queries → method chunks
-        if any(kw in query_lower for kw in ['method', 'approach', 'algorithm', '方法', '演算法', 'architecture', 'model', '模型']):
-            chunk_types.add('method')
+        # Method queries → Methodology section (實際存在，最常見 49 個)
+        if any(kw in query_lower for kw in ['method', 'approach', 'algorithm', '方法', '演算法', 'architecture', 'model', '模型', 'technique']):
+            section_names.update(['Methodology'])  # 使用實際存在的 Methodology
         
-        # Metric queries → metric chunks
-        if any(kw in query_lower for kw in ['metric', 'accuracy', 'precision', 'recall', 'f1', 'bleu', 'rouge', '指標', '準確率']):
-            chunk_types.add('metric')
+        # Metric/Result queries → Results section (實際存在 29 個)
+        if any(kw in query_lower for kw in ['metric', 'accuracy', 'precision', 'recall', 'f1', 'bleu', 'rouge', '指標', '準確率', 
+                                             'result', 'performance', 'evaluation', 'outcome', '結果', '性能', '效能', '表現']):
+            section_names.update(['Results', 'Dataset'])  # Results 存在，Dataset 可能包含實驗設置
         
-        # Domain queries → domain chunks
-        if any(kw in query_lower for kw in ['domain', 'application', 'use case', 'scenario', 'field', '領域', '應用', '場景']):
-            chunk_types.add('domain')
+        # Background/overview queries → Abstract, Introduction sections (實際存在)
+        if any(kw in query_lower for kw in ['overview', 'summary', 'abstract', 'introduction', '概述', '摘要', '導論', '背景', 'background']):
+            section_names.update(['Abstract', 'Introduction', 'Related_Work'])  # 使用實際存在的命名
         
-        # Result queries → results chunks (often need metrics too)
-        if any(kw in query_lower for kw in ['result', 'performance', 'evaluation', 'outcome', '結果', '性能', '效能', '表現']):
-            chunk_types.add('results')
-            # Performance queries often need metric details
-            if any(kw in query_lower for kw in ['performance', '性能', '效能']):
-                chunk_types.add('metric')
+        # Conclusion queries → Conclusion section (實際存在 29 個)
+        if any(kw in query_lower for kw in ['conclusion', 'future', 'discussion', '結論', '未來', '討論']):
+            section_names.update(['Conclusion'])
         
-        # Background/overview queries → background chunks
-        if any(kw in query_lower for kw in ['overview', 'summary', 'abstract', 'introduction', '概述', '摘要', '導論', '背景']):
-            chunk_types.add('background')
-        
-        # 根據缺失資訊補充
+        # 根據缺失資訊補充（使用實際存在的 section names）
         for missing in missing_info:
             missing_lower = str(missing).lower()
             
             if 'parameter' in missing_lower or '參數' in missing_lower or 'config' in missing_lower:
-                chunk_types.add('method')
-                chunk_types.add('dataset')
+                section_names.update(['Methodology', 'Dataset'])
             
             if 'dataset' in missing_lower or '資料集' in missing_lower or 'data' in missing_lower:
-                chunk_types.add('dataset')
+                section_names.update(['Dataset', 'Methodology'])
             
             if 'metric' in missing_lower or '指標' in missing_lower or 'measure' in missing_lower:
-                chunk_types.add('metric')
+                section_names.update(['Results', 'Dataset'])
             
             if 'result' in missing_lower or '結果' in missing_lower or 'performance' in missing_lower:
-                chunk_types.add('results')
-                chunk_types.add('metric')  # Results often need metrics
-            
-            if 'domain' in missing_lower or '領域' in missing_lower or 'application' in missing_lower:
-                chunk_types.add('domain')
+                section_names.update(['Results', 'Methodology'])
             
             if 'detail' in missing_lower or '詳細' in missing_lower:
-                # Generic details → include method + results
-                chunk_types.add('method')
-                chunk_types.add('results')
+                # Generic details → include methodology + results
+                section_names.update(['Methodology', 'Results'])
         
-        # 如果沒有匹配，使用核心類型（排除 other）
-        if not chunk_types:
-            chunk_types = {'method', 'dataset', 'metric', 'results'}
+        # 如果沒有匹配，返回核心 sections（使用實際存在的命名）
+        if not section_names:
+            section_names = {'Methodology', 'Results', 'Dataset', 'Introduction'}
         
-        result = list(chunk_types)
-        logger.info(f"  Determined chunk types for Layer2: {result}")
+        result = list(section_names)
+        logger.info(f"  Determined section names for Layer2: {result}")
         
         return result

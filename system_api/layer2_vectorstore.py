@@ -551,18 +551,25 @@ class Layer2VectorStore:
                 logger.warning(f"No chunks found for papers: {filter_ids}")
                 return []
             
-            # NEW: Filter by chunk_types if specified
+            # NEW: Filter by chunk_types/section_names if specified
             if filter_chunk_types:
                 original_count = len(candidate_chunks)
+                
+                # Filter by both chunk_type and section_name for flexibility
+                # This supports both semantic chunk types and section-based chunking
                 candidate_chunks = [
                     chunk for chunk in candidate_chunks
-                    if chunk.get('metadata', {}).get('chunk_type') in filter_chunk_types
+                    if (chunk.get('metadata', {}).get('chunk_type') in filter_chunk_types or
+                        chunk.get('metadata', {}).get('section_name') in filter_chunk_types)
                 ]
+                
                 logger.info(f"Filtered by chunk_types {filter_chunk_types}: {original_count} → {len(candidate_chunks)} chunks")
                 
                 if not candidate_chunks:
                     logger.warning(f"No chunks of types {filter_chunk_types} found")
-                    return []
+                    # Fallback: retrieve all chunks when filtering is too restrictive
+                    candidate_chunks = self._document_store.get_chunks_by_paper_ids(filter_ids)
+                    logger.info(f"Fallback: retrieving all {len(candidate_chunks)} chunks without type filtering")
             
             # 限制候選數量以避免太慢
             max_candidates = self._reranker_config.get('max_candidates', 300)

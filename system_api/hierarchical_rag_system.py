@@ -285,14 +285,21 @@ class HierarchicalRAGSystem:
         self.graph_retriever: Optional[Any] = None
         self.graph_integrator: Optional[Any] = None
         
+        # Always initialize GraphIntegrator (needed for single paper query chunk type filtering)
+        try:
+            from system_api.graph_integrator import GraphIntegrator
+            self.graph_integrator = GraphIntegrator(self.llm)
+            logger.info("✓ GraphIntegrator initialized (for chunk type determination)")
+        except Exception as e:
+            logger.warning(f"⚠️  Failed to initialize GraphIntegrator: {e}")
+            logger.warning("  Chunk type filtering will be disabled")
+        
         if self.config.get('graph_first', {}).get('enabled', False):
             # Check if graph components are available
             if self.index_manager.graph_manager:
                 from system_api.graph_retriever import GraphRetriever
-                from system_api.graph_integrator import GraphIntegrator
                 
                 self.graph_retriever = GraphRetriever(self.index_manager.graph_manager)
-                self.graph_integrator = GraphIntegrator(self.llm)
                 
                 logger.info("✓ Graph-first components initialized")
                 logger.info(f"  Graph query top-k: {self.config['graph_first']['graph_query_top_k']}")
@@ -640,6 +647,195 @@ class HierarchicalRAGSystem:
         
         return sorted(pdf_paths)
     
+    def query_single_paper(self, query: str, return_metadata: bool = False) -> Any:
+        """
+        Query for a SINGLE SPECIFIC paper's details (specialized for AssistantCall)
+        
+        Flow:
+        1. Layer1: Identify the specific paper (return top-1 most relevant)
+        2. Check if abstract is sufficient to answer the query
+        3. If not sufficient, go to Layer2 for detailed chunks with semantic filtering
+        
+        Args:
+            query: User query about a specific paper
+            return_metadata: If True, return full result dict with metadata
+            
+        Returns:
+            Generated answer string, or full result dict if return_metadata=True
+        """
+        start_time = time.time()
+        logger.info(f"=== Single Paper Query Mode ===")
+        logger.info(f"Query: '{query[:100]}'")
+        
+        result = {
+            'status': 'success',
+            'query': query,
+            'mode': 'single_paper',
+            'layers_used': [],
+            'timings': {}
+        }
+        
+        try:
+            # ============================================================
+            # STEP 1: Layer 1 - Identify the target paper (top-1)
+            # ============================================================
+            logger.info("\n" + "="*60)
+            logger.info("LAYER 1: Identify Target Paper")
+            logger.info("="*60)
+            
+            layer1_start = time.time()
+            
+            if not self.layer1.is_initialized:
+                raise ValueError("Layer 1 index not initialized")
+            
+            # Get top-1 most relevant paper
+            layer1_results = self.layer1.search_with_scores(query=query, k=1)
+            
+            if not layer1_results:
+                result['status'] = 'no_results'
+                result['message'] = '未找到相關論文'
+                result['timings']['total'] = time.time() - start_time
+                if return_metadata:
+                    result['answer'] = result['message']
+                    return result
+                return result['message']
+            
+            target_paper_doc, paper_score = layer1_results[0]
+            target_paper_id = target_paper_doc.metadata['paper_id']
+            target_paper_title = target_paper_doc.metadata.get('title', 'Unknown')
+            target_paper_abstract = target_paper_doc.page_content
+            
+            result['timings']['layer1_identification'] = time.time() - layer1_start
+            result['layers_used'].append('layer1')
+            result['target_paper'] = {
+                'paper_id': target_paper_id,
+                'title': target_paper_title,
+                'score': paper_score,
+                'abstract': target_paper_abstract
+            }
+            
+            logger.info(f"✓ Target paper identified:")
+            logger.info(f"  Title: {target_paper_title}")
+            logger.info(f"  Score: {paper_score:.4f}")
+            logger.info(f"  Abstract length: {len(target_paper_abstract)} chars")
+            
+            # ============================================================
+            # STEP 2: Check if abstract is sufficient
+            # ============================================================
+            logger.info("\n" + "="*60)
+            logger.info("STEP 2: Abstract Sufficiency Check")
+            logger.info("="*60)
+            
+            eval_start = time.time()
+            
+            # Use confidence evaluator to check if abstract is sufficient
+            abstract_evaluation = self.confidence_evaluator.evaluate(
+                query=query,
+                retrieved_docs=[target_paper_doc],
+                layer=1,
+                threshold=0.7  # High threshold for abstract sufficiency
+            )
+            
+            result['timings']['abstract_evaluation'] = time.time() - eval_start
+            result['abstract_evaluation'] = abstract_evaluation
+            
+            logger.info(f"Abstract evaluation:")
+            logger.info(f"  Confidence: {abstract_evaluation['confidence']:.2f}")
+            logger.info(f"  Sufficient: {not abstract_evaluation['should_continue']}")
+            logger.info(f"  Reasoning: {abstract_evaluation['reasoning'][:150]}...")
+            
+            # If abstract is sufficient, return answer based on abstract
+            if not abstract_evaluation['should_continue']:
+                logger.info("\n✓ Abstract is sufficient to answer the query")
+                result['final_docs'] = [target_paper_doc]
+                result['terminated_at'] = 'abstract'
+                result['timings']['total'] = time.time() - start_time
+                
+                # Generate answer from abstract
+                answer = self._generate_answer(query, result)
+                if return_metadata:
+                    result['answer'] = answer
+                    return result
+                return answer
+            
+            logger.info("\n→ Abstract insufficient, retrieving detailed chunks from Layer2")
+            
+            # ============================================================
+            # STEP 3: Layer2 - Retrieve detailed chunks with semantic filtering
+            # ============================================================
+            logger.info("\n" + "="*60)
+            logger.info("LAYER 2: Detailed Chunk Retrieval with Semantic Filtering")
+            logger.info("="*60)
+            
+            layer2_start = time.time()
+            
+            if not self.layer2.is_initialized:
+                raise ValueError("Layer 2 index not initialized")
+            
+            # Determine which semantic chunk types are relevant to the query
+            relevant_chunk_types = None
+            if self.chunk_classifier and self.graph_integrator:
+                # Use GraphIntegrator's method to determine chunk types
+                relevant_chunk_types = self.graph_integrator.determine_chunk_types_for_query(
+                    query=query,
+                    missing_info=abstract_evaluation.get('missing_aspects', [])
+                )
+                logger.info(f"📌 Relevant chunk types: {relevant_chunk_types}")
+            else:
+                logger.info("ℹ️  No chunk type filtering (retrieving all types)")
+            
+            # Retrieve chunks from the target paper only, with chunk type filtering
+            CHUNKS_TO_RETRIEVE = 5
+            layer2_results = self.layer2.search_with_scores(
+                query=query,
+                k=CHUNKS_TO_RETRIEVE,
+                paper_ids=[target_paper_id],
+                filter_chunk_types=relevant_chunk_types
+            )
+            
+            layer2_docs = [doc for doc, score in layer2_results]
+            
+            result['timings']['layer2_retrieval'] = time.time() - layer2_start
+            result['layers_used'].append('layer2')
+            result['layer2_docs'] = layer2_docs
+            result['layer2_chunk_types'] = relevant_chunk_types
+            
+            logger.info(f"✓ Retrieved {len(layer2_docs)} detailed chunks")
+            if layer2_results:
+                logger.info("Top chunks:")
+                for i, (doc, score) in enumerate(layer2_results[:3], 1):
+                    chunk_type = doc.metadata.get('chunk_type', 'unknown')
+                    preview = doc.page_content[:80].replace('\n', ' ')
+                    logger.info(f"  {i}. [{score:.3f}] [{chunk_type}] {preview}...")
+            
+            # ============================================================
+            # STEP 4: Generate final answer
+            # ============================================================
+            result['final_docs'] = layer2_docs
+            result['terminated_at'] = 'layer2'
+            result['timings']['total'] = time.time() - start_time
+            
+            logger.info(f"\n=== Query completed in {result['timings']['total']:.2f}s ===")
+            
+            # Generate answer
+            answer = self._generate_answer(query, result)
+            
+            if return_metadata:
+                result['answer'] = answer
+                return result
+            return answer
+            
+        except Exception as e:
+            logger.error(f"Single paper query failed: {e}", exc_info=True)
+            result['status'] = 'error'
+            result['message'] = str(e)
+            result['timings']['total'] = time.time() - start_time
+            
+            if return_metadata:
+                result['answer'] = f"查詢失敗: {str(e)}"
+                return result
+            return f"查詢失敗: {str(e)}"
+    
     def query(self, query: str, return_metadata: bool = False) -> Any:
         """
         Query the hierarchical RAG system (blocking version)
@@ -672,6 +868,168 @@ class HierarchicalRAGSystem:
             result['answer'] = answer
             return result
         return answer
+    
+    def query_single_paper_stream(self, query: str) -> Generator[str, None, None]:
+        """
+        Query for a SINGLE SPECIFIC paper's details with streaming (for AssistantCall)
+        
+        Flow:
+        1. Layer1: Identify the specific paper (return top-1 most relevant)
+        2. Check if abstract is sufficient to answer the query
+        3. If not sufficient, go to Layer2 for detailed chunks with semantic filtering
+        4. Stream the answer generation
+        
+        Args:
+            query: User query about a specific paper
+            
+        Yields:
+            Answer chunks as they are generated
+        """
+        start_time = time.time()
+        logger.info(f"=== Single Paper Query Mode (Streaming) ===")
+        logger.info(f"Query: '{query[:100]}'")
+        
+        result = {
+            'status': 'success',
+            'query': query,
+            'mode': 'single_paper',
+            'layers_used': [],
+            'timings': {}
+        }
+        
+        try:
+            # ============================================================
+            # STEP 1: Layer 1 - Identify the target paper (top-1)
+            # ============================================================
+            logger.info("\n" + "="*60)
+            logger.info("LAYER 1: Identify Target Paper")
+            logger.info("="*60)
+            
+            layer1_start = time.time()
+            
+            if not self.layer1.is_initialized:
+                yield "錯誤: Layer 1 未初始化"
+                return
+            
+            # Get top-1 most relevant paper
+            layer1_results = self.layer1.search_with_scores(query=query, k=1)
+            
+            if not layer1_results:
+                yield "未找到相關論文"
+                return
+            
+            target_paper_doc, paper_score = layer1_results[0]
+            target_paper_id = target_paper_doc.metadata['paper_id']
+            target_paper_title = target_paper_doc.metadata.get('title', 'Unknown')
+            target_paper_abstract = target_paper_doc.page_content
+            
+            result['timings']['layer1_identification'] = time.time() - layer1_start
+            result['layers_used'].append('layer1')
+            result['target_paper'] = {
+                'paper_id': target_paper_id,
+                'title': target_paper_title,
+                'score': paper_score,
+                'abstract': target_paper_abstract
+            }
+            
+            logger.info(f"✓ Target paper identified:")
+            logger.info(f"  Title: {target_paper_title}")
+            logger.info(f"  Score: {paper_score:.4f}")
+            
+            # ============================================================
+            # STEP 2: Check if abstract is sufficient
+            # ============================================================
+            logger.info("\n" + "="*60)
+            logger.info("STEP 2: Abstract Sufficiency Check")
+            logger.info("="*60)
+            
+            eval_start = time.time()
+            
+            # Use confidence evaluator to check if abstract is sufficient
+            abstract_evaluation = self.confidence_evaluator.evaluate(
+                query=query,
+                retrieved_docs=[target_paper_doc],
+                layer=1,
+                threshold=0.7
+            )
+            
+            result['timings']['abstract_evaluation'] = time.time() - eval_start
+            result['abstract_evaluation'] = abstract_evaluation
+            
+            logger.info(f"Abstract evaluation:")
+            logger.info(f"  Confidence: {abstract_evaluation['confidence']:.2f}")
+            logger.info(f"  Sufficient: {not abstract_evaluation['should_continue']}")
+            
+            # If abstract is sufficient, stream answer based on abstract
+            if not abstract_evaluation['should_continue']:
+                logger.info("\n✓ Abstract is sufficient to answer the query")
+                result['final_docs'] = [target_paper_doc]
+                result['terminated_at'] = 'abstract'
+                result['timings']['total'] = time.time() - start_time
+                
+                # Stream answer from abstract
+                yield from self._generate_answer_stream(query, result)
+                return
+            
+            logger.info("\n→ Abstract insufficient, retrieving detailed chunks from Layer2")
+            
+            # ============================================================
+            # STEP 3: Layer2 - Retrieve detailed chunks with semantic filtering
+            # ============================================================
+            logger.info("\n" + "="*60)
+            logger.info("LAYER 2: Detailed Chunk Retrieval with Semantic Filtering")
+            logger.info("="*60)
+            
+            layer2_start = time.time()
+            
+            if not self.layer2.is_initialized:
+                yield "錯誤: Layer 2 未初始化"
+                return
+            
+            # Determine which semantic chunk types are relevant to the query
+            relevant_chunk_types = None
+            if self.chunk_classifier and self.graph_integrator:
+                relevant_chunk_types = self.graph_integrator.determine_chunk_types_for_query(
+                    query=query,
+                    missing_info=abstract_evaluation.get('missing_aspects', [])
+                )
+                logger.info(f"📌 Relevant chunk types: {relevant_chunk_types}")
+            else:
+                logger.info("ℹ️  No chunk type filtering (retrieving all types)")
+            
+            # Retrieve chunks from the target paper only, with chunk type filtering
+            CHUNKS_TO_RETRIEVE = 5
+            layer2_results = self.layer2.search_with_scores(
+                query=query,
+                k=CHUNKS_TO_RETRIEVE,
+                paper_ids=[target_paper_id],
+                filter_chunk_types=relevant_chunk_types
+            )
+            
+            layer2_docs = [doc for doc, score in layer2_results]
+            
+            result['timings']['layer2_retrieval'] = time.time() - layer2_start
+            result['layers_used'].append('layer2')
+            result['layer2_docs'] = layer2_docs
+            result['layer2_chunk_types'] = relevant_chunk_types
+            
+            logger.info(f"✓ Retrieved {len(layer2_docs)} detailed chunks")
+            
+            # ============================================================
+            # STEP 4: Stream final answer
+            # ============================================================
+            result['final_docs'] = layer2_docs
+            result['terminated_at'] = 'layer2'
+            result['timings']['total'] = time.time() - start_time
+            
+            logger.info(f"\n=== Query completed in {result['timings']['total']:.2f}s ===")
+            
+            # Stream answer
+            yield from self._generate_answer_stream(query, result)
+            
+        except Exception as e:
+            logger.error(f"Single paper query stream failed: {e}", exc_info=True)
+            yield f"查詢失敗: {str(e)}"
     
     def query_stream(self, query: str) -> Generator[str, None, None]:
         """
@@ -1167,7 +1525,7 @@ class HierarchicalRAGSystem:
                 paper_results = self.layer2.search_with_scores(
                     query=query,
                     k=CHUNKS_PER_PAPER,
-                    filter_paper_ids=[paper_id],
+                    paper_ids=[paper_id],
                     filter_chunk_types=filter_chunk_types  # NEW: Apply chunk type filter
                 )
                 
