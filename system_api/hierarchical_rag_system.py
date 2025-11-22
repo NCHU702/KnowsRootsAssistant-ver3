@@ -177,9 +177,12 @@ class HierarchicalRAGSystem:
         self.llm = OllamaLLM(model=self.model_name, num_ctx=4096)
         self.embeddings = OllamaEmbeddings(model=self.embedding_model)
         
-        # Separate LLM for confidence evaluation (use same model, deterministic mode preferred)
-        # Note: If temperature is not supported, rely on model's default behavior
-        self.evaluation_llm = OllamaLLM(model=self.model_name, num_ctx=8192)
+        # Separate LLM for confidence evaluation
+        # Use a faster, smaller model for quick evaluation tasks
+        # Default to llama3.2:latest (3B model) for speed
+        evaluation_model = self.config.get('evaluation_model', 'llama3.2:latest')
+        logger.info(f"  Evaluation Model: {evaluation_model}")
+        self.evaluation_llm = OllamaLLM(model=evaluation_model, num_ctx=4096)
         
         # Core components
         self.abstract_extractor = AbstractExtractor(self.llm)
@@ -688,8 +691,8 @@ class HierarchicalRAGSystem:
             if not self.layer1.is_initialized:
                 raise ValueError("Layer 1 index not initialized")
             
-            # Get top-1 most relevant paper
-            layer1_results = self.layer1.search_with_scores(query=query, k=1)
+            # STRATEGY: Get top-5, then use embedding similarity on titles to find best match
+            layer1_results = self.layer1.search_with_scores(query=query, k=5)
             
             if not layer1_results:
                 result['status'] = 'no_results'
@@ -700,7 +703,46 @@ class HierarchicalRAGSystem:
                     return result
                 return result['message']
             
-            target_paper_doc, paper_score = layer1_results[0]
+            # Get query embedding
+            query_embedding = self.embeddings.embed_query(query)
+            
+            # Calculate title similarity for each paper in top-5
+            best_title_match = None
+            best_title_score = -1
+            best_title_match_idx = -1
+            
+            for idx, (doc, abstract_score) in enumerate(layer1_results):
+                paper_id = doc.metadata['paper_id']
+                title = doc.metadata.get('title', paper_id)
+                
+                # Get title embedding and calculate cosine similarity
+                title_embedding = self.embeddings.embed_query(paper_id)
+                
+                # Cosine similarity
+                import numpy as np
+                similarity = np.dot(query_embedding, title_embedding) / (
+                    np.linalg.norm(query_embedding) * np.linalg.norm(title_embedding)
+                )
+                
+                logger.info(f"  Paper {idx+1}: title_sim={similarity:.4f}, abstract_sim={abstract_score:.4f} - {paper_id[:50]}")
+                
+                if similarity > best_title_score:
+                    best_title_score = similarity
+                    best_title_match = doc
+                    best_title_match_idx = idx
+            
+            # Use paper with highest title similarity if it's significantly higher than abstract-based top-1
+            # Threshold: title similarity > 0.5 OR (title similarity > 0.3 AND higher than top-1's abstract score)
+            abstract_top1_score = layer1_results[0][1]
+            
+            if best_title_score > 0.5 or (best_title_score > 0.3 and best_title_score > abstract_top1_score):
+                target_paper_doc = best_title_match
+                paper_score = best_title_score
+                logger.info(f"✓ Using title-matched paper (rank {best_title_match_idx+1}, title_sim={best_title_score:.4f})")
+            else:
+                target_paper_doc, paper_score = layer1_results[0]
+                logger.info(f"No strong title match, using top-1 by abstract similarity (score={paper_score:.4f})")
+            
             target_paper_id = target_paper_doc.metadata['paper_id']
             target_paper_title = target_paper_doc.metadata.get('title', 'Unknown')
             target_paper_abstract = target_paper_doc.page_content
@@ -722,41 +764,60 @@ class HierarchicalRAGSystem:
             # ============================================================
             # STEP 2: Check if abstract is sufficient
             # ============================================================
-            logger.info("\n" + "="*60)
-            logger.info("STEP 2: Abstract Sufficiency Check")
-            logger.info("="*60)
+            # OPTIMIZATION: If title similarity is very high (>0.5), skip abstract check
+            # This indicates user explicitly mentioned the paper name, so they want details
+            skip_abstract_check = best_title_score > 0.5
             
-            eval_start = time.time()
-            
-            # Use confidence evaluator to check if abstract is sufficient
-            abstract_evaluation = self.confidence_evaluator.evaluate(
-                query=query,
-                retrieved_docs=[target_paper_doc],
-                layer=1,
-                threshold=0.7  # High threshold for abstract sufficiency
-            )
-            
-            result['timings']['abstract_evaluation'] = time.time() - eval_start
-            result['abstract_evaluation'] = abstract_evaluation
-            
-            logger.info(f"Abstract evaluation:")
-            logger.info(f"  Confidence: {abstract_evaluation['confidence']:.2f}")
-            logger.info(f"  Sufficient: {not abstract_evaluation['should_continue']}")
-            logger.info(f"  Reasoning: {abstract_evaluation['reasoning'][:150]}...")
-            
-            # If abstract is sufficient, return answer based on abstract
-            if not abstract_evaluation['should_continue']:
-                logger.info("\n✓ Abstract is sufficient to answer the query")
-                result['final_docs'] = [target_paper_doc]
-                result['terminated_at'] = 'abstract'
-                result['timings']['total'] = time.time() - start_time
+            if skip_abstract_check:
+                logger.info("\n" + "="*60)
+                logger.info("STEP 2: Abstract Check SKIPPED (high title match)")
+                logger.info("="*60)
+                logger.info(f"  Title similarity: {best_title_score:.4f} > 0.5")
+                logger.info(f"  → User explicitly mentioned paper name, going directly to Layer2 for details")
+                result['timings']['abstract_evaluation'] = 0.0
+                abstract_evaluation = {
+                    'confidence': 0.0,
+                    'should_continue': True,
+                    'reasoning': 'Skipped due to high title similarity - user wants detailed information',
+                    'missing_aspects': []  # No specific aspects identified
+                }
+                result['abstract_evaluation'] = abstract_evaluation
+            else:
+                logger.info("\n" + "="*60)
+                logger.info("STEP 2: Abstract Sufficiency Check")
+                logger.info("="*60)
                 
-                # Generate answer from abstract
-                answer = self._generate_answer(query, result)
-                if return_metadata:
-                    result['answer'] = answer
-                    return result
-                return answer
+                eval_start = time.time()
+                
+                # Use confidence evaluator to check if abstract is sufficient
+                abstract_evaluation = self.confidence_evaluator.evaluate(
+                    query=query,
+                    retrieved_docs=[target_paper_doc],
+                    layer=1,
+                    threshold=0.7  # High threshold for abstract sufficiency
+                )
+                
+                result['timings']['abstract_evaluation'] = time.time() - eval_start
+                result['abstract_evaluation'] = abstract_evaluation
+                
+                logger.info(f"Abstract evaluation:")
+                logger.info(f"  Confidence: {abstract_evaluation['confidence']:.2f}")
+                logger.info(f"  Sufficient: {not abstract_evaluation['should_continue']}")
+                logger.info(f"  Reasoning: {abstract_evaluation['reasoning'][:150]}...")
+                
+                # If abstract is sufficient, return answer based on abstract
+                if not abstract_evaluation['should_continue']:
+                    logger.info("\n✓ Abstract is sufficient to answer the query")
+                    result['final_docs'] = [target_paper_doc]
+                    result['terminated_at'] = 'abstract'
+                    result['timings']['total'] = time.time() - start_time
+                    
+                    # Generate answer from abstract
+                    answer = self._generate_answer(query, result)
+                    if return_metadata:
+                        result['answer'] = answer
+                        return result
+                    return answer
             
             logger.info("\n→ Abstract insufficient, retrieving detailed chunks from Layer2")
             
@@ -911,14 +972,52 @@ class HierarchicalRAGSystem:
                 yield "錯誤: Layer 1 未初始化"
                 return
             
-            # Get top-1 most relevant paper
-            layer1_results = self.layer1.search_with_scores(query=query, k=1)
+            # STRATEGY: Check top-5 results for exact title match, prioritize if found
+            layer1_results = self.layer1.search_with_scores(query=query, k=5)
             
             if not layer1_results:
                 yield "未找到相關論文"
                 return
             
-            target_paper_doc, paper_score = layer1_results[0]
+            # Get query embedding
+            query_embedding = self.embeddings.embed_query(query)
+            
+            # Calculate title similarity for each paper in top-5
+            best_title_match = None
+            best_title_score = -1
+            best_title_match_idx = -1
+            
+            import numpy as np
+            for idx, (doc, abstract_score) in enumerate(layer1_results):
+                paper_id = doc.metadata['paper_id']
+                title = doc.metadata.get('title', paper_id)
+                
+                # Get title embedding and calculate cosine similarity
+                title_embedding = self.embeddings.embed_query(paper_id)
+                
+                # Cosine similarity
+                similarity = np.dot(query_embedding, title_embedding) / (
+                    np.linalg.norm(query_embedding) * np.linalg.norm(title_embedding)
+                )
+                
+                logger.info(f"  Paper {idx+1}: title_sim={similarity:.4f}, abstract_sim={abstract_score:.4f} - {paper_id[:50]}")
+                
+                if similarity > best_title_score:
+                    best_title_score = similarity
+                    best_title_match = doc
+                    best_title_match_idx = idx
+            
+            # Use paper with highest title similarity if it's significantly higher
+            abstract_top1_score = layer1_results[0][1]
+            
+            if best_title_score > 0.5 or (best_title_score > 0.3 and best_title_score > abstract_top1_score):
+                target_paper_doc = best_title_match
+                paper_score = best_title_score
+                logger.info(f"✓ Using title-matched paper (rank {best_title_match_idx+1}, title_sim={best_title_score:.4f})")
+            else:
+                target_paper_doc, paper_score = layer1_results[0]
+                logger.info(f"No strong title match, using top-1 by abstract similarity (score={paper_score:.4f})")
+            
             target_paper_id = target_paper_doc.metadata['paper_id']
             target_paper_title = target_paper_doc.metadata.get('title', 'Unknown')
             target_paper_abstract = target_paper_doc.page_content
@@ -939,37 +1038,55 @@ class HierarchicalRAGSystem:
             # ============================================================
             # STEP 2: Check if abstract is sufficient
             # ============================================================
-            logger.info("\n" + "="*60)
-            logger.info("STEP 2: Abstract Sufficiency Check")
-            logger.info("="*60)
+            # OPTIMIZATION: If title similarity is very high (>0.5), skip abstract check
+            skip_abstract_check = best_title_score > 0.5
             
-            eval_start = time.time()
-            
-            # Use confidence evaluator to check if abstract is sufficient
-            abstract_evaluation = self.confidence_evaluator.evaluate(
-                query=query,
-                retrieved_docs=[target_paper_doc],
-                layer=1,
-                threshold=0.7
-            )
-            
-            result['timings']['abstract_evaluation'] = time.time() - eval_start
-            result['abstract_evaluation'] = abstract_evaluation
-            
-            logger.info(f"Abstract evaluation:")
-            logger.info(f"  Confidence: {abstract_evaluation['confidence']:.2f}")
-            logger.info(f"  Sufficient: {not abstract_evaluation['should_continue']}")
-            
-            # If abstract is sufficient, stream answer based on abstract
-            if not abstract_evaluation['should_continue']:
-                logger.info("\n✓ Abstract is sufficient to answer the query")
-                result['final_docs'] = [target_paper_doc]
-                result['terminated_at'] = 'abstract'
-                result['timings']['total'] = time.time() - start_time
+            if skip_abstract_check:
+                logger.info("\n" + "="*60)
+                logger.info("STEP 2: Abstract Check SKIPPED (high title match)")
+                logger.info("="*60)
+                logger.info(f"  Title similarity: {best_title_score:.4f} > 0.5")
+                logger.info(f"  → User explicitly mentioned paper name, going directly to Layer2 for details")
+                result['timings']['abstract_evaluation'] = 0.0
+                abstract_evaluation = {
+                    'confidence': 0.0,
+                    'should_continue': True,
+                    'reasoning': 'Skipped due to high title similarity',
+                    'missing_aspects': []
+                }
+                result['abstract_evaluation'] = abstract_evaluation
+            else:
+                logger.info("\n" + "="*60)
+                logger.info("STEP 2: Abstract Sufficiency Check")
+                logger.info("="*60)
                 
-                # Stream answer from abstract
-                yield from self._generate_answer_stream(query, result)
-                return
+                eval_start = time.time()
+                
+                # Use confidence evaluator to check if abstract is sufficient
+                abstract_evaluation = self.confidence_evaluator.evaluate(
+                    query=query,
+                    retrieved_docs=[target_paper_doc],
+                    layer=1,
+                    threshold=0.7
+                )
+                
+                result['timings']['abstract_evaluation'] = time.time() - eval_start
+                result['abstract_evaluation'] = abstract_evaluation
+                
+                logger.info(f"Abstract evaluation:")
+                logger.info(f"  Confidence: {abstract_evaluation['confidence']:.2f}")
+                logger.info(f"  Sufficient: {not abstract_evaluation['should_continue']}")
+                
+                # If abstract is sufficient, stream answer based on abstract
+                if not abstract_evaluation['should_continue']:
+                    logger.info("\n✓ Abstract is sufficient to answer the query")
+                    result['final_docs'] = [target_paper_doc]
+                    result['terminated_at'] = 'abstract'
+                    result['timings']['total'] = time.time() - start_time
+                    
+                    # Stream answer from abstract
+                    yield from self._generate_answer_stream(query, result)
+                    return
             
             logger.info("\n→ Abstract insufficient, retrieving detailed chunks from Layer2")
             
