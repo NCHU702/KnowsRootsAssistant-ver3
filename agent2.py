@@ -344,14 +344,19 @@ def graph_analysis_call(query: str) -> str:
         
         # Retrieve chunks from Layer2 with filtering
         layer2_docs = []
-        for paper_id in paper_ids[:5]:  # Limit to top 5 papers to avoid overload
+        max_papers = min(3, len(paper_ids))  # Limit to top 3 papers to avoid timeout
+        logger.info(f"  → Processing top {max_papers} papers out of {len(paper_ids)} found")
+        
+        for i, paper_id in enumerate(paper_ids[:max_papers], 1):
+            logger.info(f"  → [{i}/{max_papers}] Retrieving chunks for paper: {paper_id[:30]}...")
             paper_results = rag_system.layer2.search_with_scores(
                 query=query,
-                k=2,  # Top 2 chunks per paper (reduced to save time with multiple papers)
+                k=3,  # Top 3 chunks per paper (increased for better context)
                 filter_paper_ids=[paper_id],
                 filter_chunk_types=filter_sections  # ✨ Use section_name filtering
             )
             layer2_docs.extend([doc for doc, score in paper_results])
+            logger.info(f"  → [{i}/{max_papers}] Retrieved {len([doc for doc, score in paper_results])} chunks")
         
         logger.info(f"  ✓ Retrieved {len(layer2_docs)} chunks from Layer2")
         
@@ -764,13 +769,17 @@ def _generate_structured_answer(
     
     # 為每篇論文生成答案
     paper_answers = []
-    for paper_id, data in papers_chunks.items():
+    total_papers = len(papers_chunks)
+    
+    for idx, (paper_id, data) in enumerate(papers_chunks.items(), 1):
         title = data['title']
         chunks_text = "\n\n".join(data['chunks'])
         
-        # 構建prompt（不暴露Context標記）
+        logger.info(f"  ⚡ [{idx}/{total_papers}] Generating answer for: {title[:50]}...")
+        
+        # 構建prompt（簡潔版，要求 2-4 句話的精簡答案）
         if is_chinese_query:
-            prompt = f"""請根據以下論文內容回答問題。
+            prompt = f"""請根據以下論文內容簡潔回答問題。
 
 問題：{query}
 
@@ -780,15 +789,15 @@ def _generate_structured_answer(
 {chunks_text}
 
 【重要指引】
-1. 請直接回答問題，不要提及"Context"或"背景資料"等字眼
-2. 使用繁體中文回答
-3. 如果論文中有具體數據（資料集、準確率、參數等），請明確列出
-4. 回答要結構化，使用列點或段落清楚呈現
-5. 如果內容中沒有相關資訊，請說明「論文中未詳細說明此部分」
+1. 回答要簡潔明確（2-4 句話即可）
+2. 重點說明：該論文如何回應問題（使用什麼方法、資料集、結果等）
+3. 不要提及"Context"或"背景資料"等字眼
+4. 使用繁體中文
+5. 如果沒有相關資訊，簡單說明「未詳細說明」
 
-請針對「{title}」這篇論文回答："""
+請用 2-4 句話簡潔回答："""
         else:
-            prompt = f"""Based on the following paper content, answer the question.
+            prompt = f"""Based on the following paper content, answer the question concisely.
 
 Question: {query}
 
@@ -798,25 +807,26 @@ Paper Content:
 {chunks_text}
 
 【Important Guidelines】
-1. Answer directly without mentioning "Context" or "background materials"
-2. If there are specific data (datasets, accuracy, parameters, etc.), list them clearly
-3. Structure your answer with bullet points or clear paragraphs
-4. If information is not available, state "This is not detailed in the paper"
+1. Keep answer concise (2-4 sentences only)
+2. Focus on: how this paper addresses the question (methods, datasets, results)
+3. Do not mention "Context" or "background materials"
+4. If information is not available, simply state "Not detailed"
 
-Please answer for the paper "{title}":"""
+Please answer in 2-4 sentences:"""
         
         try:
-            # 設定max_tokens避免截斷
+            # 調用 LLM 生成答案
             answer = rag_system.llm.invoke(prompt)
             paper_answers.append({
                 'title': title,
                 'answer': answer.strip()
             })
+            logger.info(f"  ✓ [{idx}/{total_papers}] Answer generated ({len(answer.strip())} chars)")
         except Exception as e:
-            logger.error(f"Failed to generate answer for {title}: {e}")
+            logger.error(f"  ✗ [{idx}/{total_papers}] Failed to generate answer: {e}")
             paper_answers.append({
                 'title': title,
-                'answer': f"生成答案時發生錯誤：{str(e)}"
+                'answer': f"生成答案時發生錯誤：{str(e)}" if is_chinese_query else f"Error generating answer: {str(e)}"
             })
     
     # 組合所有論文的答案（使用新的結構化格式）
