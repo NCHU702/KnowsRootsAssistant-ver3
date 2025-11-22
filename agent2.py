@@ -347,7 +347,7 @@ def graph_analysis_call(query: str) -> str:
         for paper_id in paper_ids[:5]:  # Limit to top 5 papers to avoid overload
             paper_results = rag_system.layer2.search_with_scores(
                 query=query,
-                k=3,  # Top 3 chunks per paper
+                k=2,  # Top 2 chunks per paper (reduced to save time with multiple papers)
                 filter_paper_ids=[paper_id],
                 filter_chunk_types=filter_sections  # ✨ Use section_name filtering
             )
@@ -819,15 +819,33 @@ Please answer for the paper "{title}":"""
                 'answer': f"生成答案時發生錯誤：{str(e)}"
             })
     
-    # 組合所有論文的答案
+    # 組合所有論文的答案（使用新的結構化格式）
     if is_chinese_query:
-        structured_answer = ""
+        # 1. 先列出論文清單
+        paper_list = "論文列表：\n"
         for i, pa in enumerate(paper_answers, 1):
-            structured_answer += f"\n### 論文 {i}: {pa['title']}\n\n{pa['answer']}\n"
+            paper_list += f"\t{i}\t《{pa['title']}》\n"
+        
+        # 2. 再逐篇提供詳細內容
+        detailed_answers = ""
+        for pa in paper_answers:
+            # 提取論文簡稱（取標題的前15個字或第一個下劃線前的部分）
+            title_short = pa['title'].split('_')[0] if '_' in pa['title'] else pa['title'][:15]
+            detailed_answers += f"\n【來源：{title_short}】\n{pa['answer']}\n"
+        
+        structured_answer = paper_list + detailed_answers
     else:
-        structured_answer = ""
+        # English format
+        paper_list = "Paper List:\n"
         for i, pa in enumerate(paper_answers, 1):
-            structured_answer += f"\n### Paper {i}: {pa['title']}\n\n{pa['answer']}\n"
+            paper_list += f"\t{i}\t《{pa['title']}》\n"
+        
+        detailed_answers = ""
+        for pa in paper_answers:
+            title_short = pa['title'].split('_')[0] if '_' in pa['title'] else pa['title'][:15]
+            detailed_answers += f"\n【Source: {title_short}】\n{pa['answer']}\n"
+        
+        structured_answer = paper_list + detailed_answers
     
     return structured_answer.strip()
 
@@ -841,52 +859,15 @@ def _format_final_answer(
     格式化最終答案，提供清晰的結構
     
     Args:
-        graph_summary: Graph查詢的摘要
-        detailed_content: 詳細內容
+        graph_summary: Graph查詢的摘要（不使用，因為詳細內容已包含論文列表）
+        detailed_content: 詳細內容（已包含論文列表和逐篇說明）
         paper_count: 論文數量
         
     Returns:
         格式化的最終答案
     """
-    # 檢測語言
-    def is_chinese(text: str) -> bool:
-        chinese_chars = sum(1 for char in text if '\u4e00' <= char <= '\u9fff')
-        return chinese_chars > len(text) * 0.3
-    
-    is_chinese_text = is_chinese(graph_summary + detailed_content)
-    
-    if is_chinese_text:
-        formatted = f"""📊 **摘要**
-
-{graph_summary}
-
-{'─' * 80}
-
-📝 **詳細說明** (共 {paper_count} 篇論文)
-
-{detailed_content}
-
-{'─' * 80}
-
-✓ 回答完成
-"""
-    else:
-        formatted = f"""📊 **Summary**
-
-{graph_summary}
-
-{'─' * 80}
-
-📝 **Detailed Information** ({paper_count} papers)
-
-{detailed_content}
-
-{'─' * 80}
-
-✓ Answer Complete
-"""
-    
-    return formatted
+    # 直接返回詳細內容（已經是結構化格式：論文列表 + 逐篇說明）
+    return detailed_content.strip()
 
 
 # Create tools for the agent
@@ -1134,8 +1115,8 @@ Thought:{agent_scratchpad}"""
             tools=tools,
             verbose=True,
             handle_parsing_errors=True,
-            max_iterations=8,  # Increased to allow tool call + final answer generation
-            max_execution_time=120,  # Increased to 120 seconds for complex queries
+            max_iterations=20,  # Increased to allow complex queries with multiple papers
+            max_execution_time=300,  # Increased to 5 minutes for queries with many papers (each paper needs LLM call)
             return_intermediate_steps=True
             # Note: early_stopping_method removed as 'generate' is not supported
         )
