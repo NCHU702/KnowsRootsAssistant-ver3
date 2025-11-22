@@ -1852,23 +1852,28 @@ class HierarchicalRAGSystem:
                 else:
                     referenced_papers.append(f"- {title}")
         
-        # Format context
+        # Format context (不使用Context標記，避免LLM複製到答案中)
         if 'expanded_contexts' in retrieval_result:
             contexts = retrieval_result['expanded_contexts']
         else:
             contexts = [doc.page_content for doc in retrieval_result['final_docs']]
         
-        context_text = "\n\n".join([f"[Context {i+1}]\n{ctx}" for i, ctx in enumerate(contexts)])
+        # 使用更自然的分隔方式，不暴露Context編號
+        context_text = "\n\n---\n\n".join(contexts)
         
         # Create prompt based on language
         if is_chinese_query:
             prompt = f"""你是一個學術研究助手。請根據以下研究論文的內容回答問題。
 
-【重要】請務必使用「繁體中文（Traditional Chinese）」回答，不要使用簡體中文。
+【重要規則】
+1. 使用「繁體中文（Traditional Chinese）」回答，不要使用簡體中文
+2. 不要在回答中提及"Context"、"背景"、"參考文獻"等字眼
+3. 直接回答問題，使用結構化的格式
+4. 如果有多個要點，請使用列點或編號
 
 問題：{query}
 
-參考文獻內容：
+論文內容：
 {context_text}
 
 【回答指引】
@@ -1877,21 +1882,34 @@ class HierarchicalRAGSystem:
    - 使用了什麼資料集？
    - 資料集有多少樣本/數據？
    - 資料來源是什麼？
-3. 如果問題問的是「方法」，請重點說明使用的技術和演算法
-4. 如果問題問的是「結果」，請重點說明實驗結果和性能指標
-5. 請針對問題的核心關鍵詞回答，不要泛泛而談
-6. 如果參考文獻中找不到相關資訊，請明確說明「論文中未提及相關資訊」
+3. 如果問題問的是「方法」，請重點說明：
+   - 使用的技術和演算法
+   - 模型架構
+   - 訓練參數
+4. 如果問題問的是「結果」，請重點說明：
+   - 實驗結果和性能指標（準確率、F1等）
+   - 與其他方法的比較
+5. 請針對問題的核心關鍵詞回答，提供具體數據
+6. 如果找不到相關資訊，請明確說明「論文中未詳細說明此部分」
 
-請根據以上內容提供完整的答案。
-記住：回答必須使用繁體中文，例如「應用」而非「应用」，「資料」而非「数据」。
+【回答格式範例】
+如果問「使用什麼資料集」：
+- 資料集名稱：XXX
+- 樣本數量：XXX筆
+- 資料來源：XXX
 
-回答："""
+請根據以上內容提供清晰、結構化的答案："""
         else:
-            prompt = f"""Based on the following research paper contexts, please answer the question.
+            prompt = f"""You are an academic research assistant. Please answer the question based on the following paper content.
+
+【Important Rules】
+1. Do NOT mention "Context", "background", or "reference" in your answer
+2. Answer directly and use structured format
+3. Use bullet points or numbering for multiple points
 
 Question: {query}
 
-Contexts:
+Paper Content:
 {context_text}
 
 【Answer Guidelines】
@@ -1900,14 +1918,23 @@ Contexts:
    - What dataset(s) were used?
    - How many samples/data points?
    - What is the data source?
-3. If the question asks about "method", focus on the techniques and algorithms used
-4. If the question asks about "results", focus on experimental outcomes and performance metrics
-5. Answer directly to the core keyword of the question, don't provide general summaries
-6. If the information is not found in the contexts, clearly state "The paper does not mention this information"
+3. If the question asks about "method", focus on:
+   - Techniques and algorithms used
+   - Model architecture
+   - Training parameters
+4. If the question asks about "results", focus on:
+   - Experimental outcomes and performance metrics (accuracy, F1, etc.)
+   - Comparisons with other methods
+5. Answer directly to the core keyword with specific data
+6. If information is not found, clearly state "This is not detailed in the paper"
 
-Please provide a comprehensive answer based on the contexts above.
+【Answer Format Example】
+If asking "what dataset":
+- Dataset name: XXX
+- Sample size: XXX
+- Data source: XXX
 
-Answer:"""
+Please provide a clear, structured answer:"""
         
         # Generate
         try:

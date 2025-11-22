@@ -10,6 +10,7 @@ import os
 import tempfile
 import threading
 from datetime import datetime
+from typing import List, Dict, Optional, Any
 from werkzeug.utils import secure_filename
 from system_api.search_engine import SearchEngine
 from system_api.rag_support import RAGChatbot
@@ -283,94 +284,610 @@ def graph_analysis_call(query: str) -> str:
     Use this tool for MACRO-level questions: relationships, trends, aggregations across papers.
     Examples: "Which papers use LSTM?", "Compare research goals", "List all datasets".
     
-    This tool will:
-    1. Query Knowledge Graph with Text2Cypher for relevant papers
-    2. Integrate Graph results with LLM
-    3. **Automatically descend to Layer2 if details are needed** (YOUR IDEAL FLOW!)
+    This tool implements YOUR 3-STAGE GRAPHRAG FLOW:
+    1. Graph query to find relevant papers/techniques
+    2. Integrate known information and answer
+    3. Determine if more details are needed → descend to Layer2 with filtering
     """
     if not graph_manager:
         return "Graph RAG is not available."
     
     logger.info(f"🔍 [Graph Tool] Querying: '{query}'")
+    
     try:
-        # Step 1: Use GraphManager.query_graph() for Text2Cypher
-        # This generates Cypher from natural language and executes it
+        # ========================================================================
+        # STAGE 1: Graph Query - Find Related Papers/Techniques
+        # ========================================================================
+        logger.info("📊 Stage 1: Executing Graph Query...")
         graph_answer = graph_manager.query_graph(query)
         
-        logger.info(f"  Graph query executed")
+        logger.info(f"  ✓ Graph query completed")
         logger.info(f"  Answer preview: {graph_answer[:150]}...")
         
-        # Check if the answer requests more details (contains keywords like "細節", "詳細", "details")
-        needs_details = any(keyword in query.lower() for keyword in [
-            '細節', '详细', 'details', 'detail', '具體', '具体', 'specific',
-            '訓練', '训练', 'training', '參數', '参数', 'parameter',
-            '實驗', '实验', 'experiment', '結果', '结果', 'result'
-        ])
+        # ========================================================================
+        # STAGE 2: Integrate Known Information
+        # ========================================================================
+        logger.info("🔗 Stage 2: Integrating Graph Results...")
+        
+        # Extract paper information from Neo4j based on original query
+        # This extracts paper_id and relevant node types for filtering
+        paper_extraction_result = _extract_papers_from_query(query)
+        
+        if not paper_extraction_result['success']:
+            logger.info("  ✓ Graph answer complete (no papers found)")
+            return f"[Graph Analysis Result]\n{graph_answer}\n\n[✓ Answer from Knowledge Graph]"
+        
+        paper_ids = paper_extraction_result['paper_ids']
+        detected_nodes = paper_extraction_result['node_types']  # e.g., ['Method', 'Dataset']
+        
+        logger.info(f"  ✓ Found {len(paper_ids)} relevant papers")
+        logger.info(f"  ✓ Detected node types: {detected_nodes}")
+        
+        # ========================================================================
+        # STAGE 3: Determine if Details Needed → Descend to Layer2
+        # ========================================================================
+        logger.info("🎯 Stage 3: Checking if details are needed...")
+        
+        needs_details = _should_descend_to_layer2(query, graph_answer)
         
         if not needs_details:
-            # Query only asks "which papers" - Graph answer is sufficient
+            # Query only asks macro-level info (e.g., "哪些論文使用YOLO")
             logger.info("  ✓ Macro-only query - Graph answer sufficient")
-            return f"[Graph Analysis Result]\n{graph_answer}\n\n[✓ Answer from Knowledge Graph - sufficient confidence]"
+            return f"ANSWER READY:\n{graph_answer}\n\n[This is the complete answer. Return it as your Final Answer now.]"
         
-        # Step 2: Extract paper IDs from graph_answer to descend to Layer2
-        logger.info("  → Query requests details - descending to Layer2")
+        # User wants details (e.g., "如何使用", "個別介紹")
+        logger.info("  → Details requested - descending to Layer2")
         
-        # Try to find papers in Neo4j based on the query
-        # Use a simple Cypher to get paper IDs mentioned in the answer
-        paper_id_query = """
-        MATCH (p:Paper)-[:USES_METHOD]->(m:Method)
-        WHERE toLower(m.name) CONTAINS "ensemble" OR toLower(m.name) CONTAINS "集成"
-        RETURN p.paper_id as paper_id, p.title as title
-        LIMIT 5
-        """
+        # Determine which section_names/chunk_types to filter
+        filter_sections = _determine_section_filters(query, detected_nodes)
+        logger.info(f"  → Filtering Layer2 by sections: {filter_sections}")
         
-        try:
-            paper_results = graph_manager.graph.query(paper_id_query)
-            paper_ids = [r['paper_id'] for r in paper_results]
-            logger.info(f"  Found {len(paper_ids)} papers for Layer2 retrieval")
-        except Exception as e:
-            logger.warning(f"  Could not extract paper IDs: {e}")
-            # Return Graph answer only
-            return f"[Graph Analysis Result]\n{graph_answer}\n\n[✓ Answer from Knowledge Graph]"
-        
-        if not paper_ids:
-            return f"[Graph Analysis Result]\n{graph_answer}\n\n[✓ Answer from Knowledge Graph]"
-        
-        # Step 3: Retrieve chunks from Layer2 (no chunk_type filtering for now)
-        # Note: Current system uses 'section_summary' chunk type, not semantic types like 'method'/'results'
-        # So we retrieve all chunk types and rely on semantic search to find relevant content
-        logger.info(f"  Retrieving top-k chunks per paper (no chunk_type filter)")
-        
-        # Step 4: Retrieve chunks from Layer2
+        # Retrieve chunks from Layer2 with filtering
         layer2_docs = []
-        for paper_id in paper_ids[:5]:  # Limit to top 5 papers
+        for paper_id in paper_ids[:5]:  # Limit to top 5 papers to avoid overload
             paper_results = rag_system.layer2.search_with_scores(
                 query=query,
-                k=3,  # Top 3 chunks per paper (increased since no filtering)
+                k=3,  # Top 3 chunks per paper
                 filter_paper_ids=[paper_id],
-                filter_chunk_types=None  # Don't filter by chunk_type
+                filter_chunk_types=filter_sections  # ✨ Use section_name filtering
             )
             layer2_docs.extend([doc for doc, score in paper_results])
         
-        logger.info(f"  Retrieved {len(layer2_docs)} chunks from Layer2")
+        logger.info(f"  ✓ Retrieved {len(layer2_docs)} chunks from Layer2")
         
-        # Step 5: Generate final answer with Graph + Layer2 content
+        # Generate detailed answer with Graph + Layer2 content
         if layer2_docs:
-            # Combine graph answer with detailed chunks
-            answer = rag_system._generate_answer(query, {
-                'final_docs': layer2_docs,
-                'status': 'success'
-            })
+            # Step 1: 清理並格式化Graph答案
+            cleaned_graph_answer = _clean_graph_answer(graph_answer)
             
-            # Prepend graph answer for context
-            combined_answer = f"{graph_answer}\n\n詳細資訊如下：\n\n{answer}"
-            return f"[Graph Analysis Result]\n{combined_answer}\n\n[✓ Answer from Knowledge Graph → Layer2 - included detailed chunks]"
+            # Step 2: 生成結構化的Layer2詳細答案
+            detailed_answer = _generate_structured_answer(
+                query=query,
+                paper_ids=paper_ids,
+                layer2_docs=layer2_docs,
+                rag_system=rag_system
+            )
+            
+            # Step 3: 組合最終答案（結構化輸出）
+            combined_answer = _format_final_answer(
+                graph_summary=cleaned_graph_answer,
+                detailed_content=detailed_answer,
+                paper_count=len(paper_ids)
+            )
+            
+            # ✨ 返回完整答案，使用 ANSWER READY 格式（LLM 更熟悉）
+            return f"""ANSWER READY:
+{combined_answer}
+
+[This is the complete answer with all details. Return it as your Final Answer NOW.]"""
         else:
-            return f"[Graph Analysis Result]\n{graph_answer}\n\n[✓ Answer from Knowledge Graph]"
+            logger.warning("  ⚠️ No chunks found in Layer2 - returning Graph answer only")
+            cleaned_answer = _clean_graph_answer(graph_answer)
+            return f"""ANSWER READY:
+{cleaned_answer}
+
+[This is the complete answer. Return it as your Final Answer NOW.]"""
         
     except Exception as e:
         logger.error(f"Graph tool error: {e}", exc_info=True)
         return f"Error querying graph: {str(e)}"
+
+
+def _extract_papers_from_query(query: str) -> dict:
+    """
+    Extract paper_ids and node types from the original query by executing a Graph query.
+    
+    Returns:
+        {
+            'success': bool,
+            'paper_ids': List[str],
+            'node_types': List[str]  # e.g., ['Method', 'Dataset', 'Domain']
+        }
+    """
+    try:
+        # Detect node types from query keywords
+        node_types = []
+        query_lower = query.lower()
+        
+        if any(kw in query_lower for kw in ['方法', 'method', '演算法', 'algorithm', 'model', '模型', 'yolo', 'lstm', 'cnn']):
+            node_types.append('Method')
+        if any(kw in query_lower for kw in ['資料集', 'dataset', 'data', '數據']):
+            node_types.append('Dataset')
+        if any(kw in query_lower for kw in ['領域', 'domain', '應用', 'application', '交通', 'transportation']):
+            node_types.append('Domain')
+        if any(kw in query_lower for kw in ['指標', 'metric', 'evaluation', '評估']):
+            node_types.append('Metric')
+        
+        # Build Cypher query based on detected node types
+        if 'Method' in node_types:
+            cypher = """
+            MATCH (p:Paper)-[:USES_METHOD]->(m:Method)
+            WHERE toLower(m.name) CONTAINS $keyword OR toLower(m.name_zh) CONTAINS $keyword
+            RETURN DISTINCT p.paper_id as paper_id, p.title as title, 'Method' as node_type
+            LIMIT 10
+            """
+            # Extract keyword from query (simple approach)
+            for kw in ['yolo', 'lstm', 'cnn', 'transformer', 'bert']:
+                if kw in query_lower:
+                    results = graph_manager.graph.query(cypher, {'keyword': kw})
+                    if results:
+                        return {
+                            'success': True,
+                            'paper_ids': [r['paper_id'] for r in results],
+                            'node_types': node_types
+                        }
+        
+        if 'Domain' in node_types:
+            cypher = """
+            MATCH (p:Paper)-[:APPLIED_IN]->(d:Domain)
+            WHERE toLower(d.name) CONTAINS $keyword OR toLower(d.name_zh) CONTAINS $keyword
+            RETURN DISTINCT p.paper_id as paper_id, p.title as title, 'Domain' as node_type
+            LIMIT 10
+            """
+            for kw in ['智慧交通', 'smart transportation', '醫療', 'medical']:
+                if kw in query_lower or kw in query:
+                    results = graph_manager.graph.query(cypher, {'keyword': kw})
+                    if results:
+                        return {
+                            'success': True,
+                            'paper_ids': [r['paper_id'] for r in results],
+                            'node_types': node_types
+                        }
+        
+        # Fallback: use generic query
+        cypher = """
+        MATCH (p:Paper)
+        RETURN p.paper_id as paper_id, p.title as title
+        LIMIT 10
+        """
+        results = graph_manager.graph.query(cypher)
+        
+        if results:
+            return {
+                'success': True,
+                'paper_ids': [r['paper_id'] for r in results],
+                'node_types': node_types or ['Paper']
+            }
+        
+        return {'success': False, 'paper_ids': [], 'node_types': []}
+        
+    except Exception as e:
+        logger.error(f"Failed to extract papers from query: {e}")
+        return {'success': False, 'paper_ids': [], 'node_types': []}
+
+
+def _should_descend_to_layer2(query: str, graph_answer: str) -> bool:
+    """
+    Determine if the query requires detailed information from Layer2.
+    
+    Returns True if query contains keywords requesting details.
+    """
+    query_lower = query.lower()
+    
+    # ========================================================================
+    # Category 1: 明確要求詳細內容
+    # ========================================================================
+    explicit_detail_keywords = [
+        # 中文
+        '如何', '怎麼', '怎样', '怎么',
+        '詳細', '详细', '具體', '具体', '細節', '细节',
+        '介紹', '介绍', '說明', '说明', '描述', '解釋', '解释',
+        '個別', '个别', '分別', '分别', '各自',
+        
+        # English  
+        'how', 'detail', 'specific', 'describe', 'explain', 'elaborate',
+        'summarize', 'summary', 'each', 'individual', 'individually'
+    ]
+    
+    # ========================================================================
+    # Category 2: 實作細節查詢
+    # ========================================================================
+    implementation_keywords = [
+        # 中文
+        '訓練', '训练', '實驗', '实验', '測試', '测试',
+        '參數', '参数', '超參數', '超参数', '配置', '設定', '设定',
+        '步驟', '步骤', '流程', '過程', '过程', '架構', '架构',
+        '實現', '实现', '實作', '实作',
+        
+        # English
+        'training', 'experiment', 'testing', 'evaluation',
+        'parameter', 'hyperparameter', 'configuration', 'setting',
+        'step', 'process', 'procedure', 'architecture',
+        'implementation', 'approach', 'technique'
+    ]
+    
+    # ========================================================================
+    # Category 3: 具體內容/數據查詢（重要！）
+    # ========================================================================
+    concrete_content_keywords = [
+        # 中文 - 資料集相關
+        '什麼資料集', '什么资料集', '哪個資料集', '哪个资料集',
+        '資料集', '资料集', '數據集', '数据集', '資料', '数据',
+        
+        # 中文 - 評估指標
+        '準確率', '准确率', '精確度', '精确度', '召回率', 'F1',
+        '指標', '指标', '評估', '评估', '效能', '性能',
+        
+        # 中文 - 模型/方法
+        '什麼方法', '什么方法', '什麼模型', '什么模型',
+        '採用', '采用', '使用什麼', '使用什么',
+        
+        # English - Dataset
+        'what dataset', 'which dataset', 'dataset used',
+        
+        # English - Metrics
+        'accuracy', 'precision', 'recall', 'metric', 'evaluation',
+        'performance', 'score', 'result',
+        
+        # English - Model/Method  
+        'what method', 'which method', 'what model', 'which model',
+        'use what', 'adopt', 'employ'
+    ]
+    
+    # ========================================================================
+    # Category 4: 比較/對比查詢
+    # ========================================================================
+    comparison_keywords = [
+        # 中文
+        '比較', '比较', '對比', '对比', '差異', '差异',
+        '不同', '區別', '区别', '優缺點', '优缺点',
+        '優勢', '优势', '劣勢', '劣势', '特點', '特点',
+        
+        # English
+        'compare', 'comparison', 'contrast', 'difference',
+        'versus', 'vs', 'distinguish', 'advantage', 'disadvantage'
+    ]
+    
+    # ========================================================================
+    # Category 5: 深入理解查詢
+    # ========================================================================
+    deep_understanding_keywords = [
+        # 中文
+        '為什麼', '为什么', '原理', '機制', '机制',
+        '貢獻', '贡献', '創新', '创新', '突破',
+        '意義', '意义', '價值', '价值',
+        
+        # English
+        'why', 'reason', 'principle', 'mechanism',
+        'contribution', 'innovation', 'novelty',
+        'significance', 'value'
+    ]
+    
+    # ========================================================================
+    # Category 6: 問題解決查詢
+    # ========================================================================
+    problem_solving_keywords = [
+        # 中文
+        '解決', '解决', '改進', '改进', '克服',
+        '問題', '问题', '挑戰', '挑战', '困難', '困难',
+        
+        # English
+        'solve', 'address', 'tackle', 'overcome',
+        'problem', 'challenge', 'issue', 'difficulty'
+    ]
+    
+    # 合併所有需要細節的關鍵詞
+    detail_keywords = (
+        explicit_detail_keywords + 
+        implementation_keywords + 
+        concrete_content_keywords +
+        comparison_keywords +
+        deep_understanding_keywords +
+        problem_solving_keywords
+    )
+    
+    # ========================================================================
+    # 判斷邏輯
+    # ========================================================================
+    
+    # 1. 檢查是否有明確的細節請求
+    has_detail_request = any(kw in query_lower for kw in detail_keywords)
+    
+    # 2. 檢查是否為Macro-only關鍵詞
+    macro_only_keywords = [
+        '哪些', '哪个', '哪幾', '有什麼', '有哪些', '有幾',
+        'which', 'what', 'list', 'list all'
+    ]
+    has_macro_keyword = any(kw in query_lower for kw in macro_only_keywords)
+    
+    # 3. 特殊規則：如果同時有macro關鍵詞和detail關鍵詞，優先detail
+    # 例如："哪些論文使用YOLO，並且他們如何使用" → 需要detail
+    if has_detail_request:
+        logger.info(f"  ✓ Details requested (keyword match): {query[:50]}...")
+        return True
+    
+    # 4. 如果只有macro關鍵詞，判定為macro-only
+    if has_macro_keyword:
+        logger.info(f"  ✓ Macro-only detected (listing query): {query[:50]}...")
+        return False
+    
+    # 5. 智能判斷：檢查query結構
+    # 如果query包含"並且"、"而且"、"and"等連接詞，通常表示複雜查詢，需要細節
+    conjunction_keywords = ['並且', '并且', '而且', '以及', '還有', '还有', 'and', 'also', 'plus']
+    has_conjunction = any(kw in query_lower for kw in conjunction_keywords)
+    
+    if has_conjunction and len(query) > 20:
+        logger.info(f"  ✓ Complex query with conjunction: {query[:50]}...")
+        return True
+    
+    # 6. 智能判斷：問句類型
+    # "為什麼"、"怎麼"、"如何" 開頭的問題通常需要詳細解釋
+    question_starters = ['為什麼', '为什么', '怎麼', '怎么', '如何', 'why', 'how']
+    starts_with_question = any(query_lower.startswith(kw) for kw in question_starters)
+    
+    if starts_with_question:
+        logger.info(f"  ✓ Question requiring explanation: {query[:50]}...")
+        return True
+    
+    # 7. 預設：短query且只提到論文 → macro-only
+    if len(query) < 15:
+        logger.info(f"  ✓ Short macro query: {query[:50]}...")
+        return False
+    
+    # 8. 最終預設：長query通常需要更多細節
+    logger.info(f"  ✓ Default: long query likely needs details: {query[:50]}...")
+    return True
+    
+
+def _determine_section_filters(query: str, detected_nodes: List[str]) -> List[str]:
+    """
+    Determine which section_names to filter based on query intent and detected node types.
+    
+    Returns:
+        List of section names (e.g., ['Method', 'Experimental Setup', 'Results'])
+    """
+    query_lower = query.lower()
+    sections = []
+    
+    # Map query keywords to section names
+    # Note: section_name in chunks come from PDF parsing (e.g., "Method", "Results", "Dataset")
+    
+    if any(kw in query_lower for kw in ['方法', 'method', '如何使用', '演算法', 'algorithm']):
+        sections.extend(['Method', 'Methodology', 'method', 'methodology'])
+    
+    if any(kw in query_lower for kw in ['資料集', 'dataset', 'data', '數據']):
+        sections.extend(['Dataset', 'Data', 'Experimental Setup', 'dataset', 'data'])
+    
+    if any(kw in query_lower for kw in ['結果', 'result', '效果', 'performance', '表現']):
+        sections.extend(['Results', 'Evaluation', 'Performance', 'results', 'evaluation'])
+    
+    if any(kw in query_lower for kw in ['實驗', 'experiment', '訓練', 'training']):
+        sections.extend(['Experimental Setup', 'Experiments', 'Training', 'experiments'])
+    
+    if any(kw in query_lower for kw in ['介紹', '說明', 'introduction', 'background', 'overview']):
+        sections.extend(['Introduction', 'Background', 'Abstract', 'introduction'])
+    
+    # If node types detected, add corresponding sections
+    if 'Method' in detected_nodes:
+        sections.extend(['Method', 'Methodology', 'method'])
+    if 'Dataset' in detected_nodes:
+        sections.extend(['Dataset', 'Data', 'dataset'])
+    
+    # Remove duplicates and return
+    sections = list(set(sections))
+    
+    # If no specific sections, return core sections (avoid empty filter)
+    if not sections:
+        sections = ['Method', 'Results', 'method', 'results']
+    
+    return sections
+
+
+# ============================================================================
+# Answer Formatting and Post-processing Functions
+# ============================================================================
+
+def _clean_graph_answer(graph_answer: str) -> str:
+    """
+    清理Graph答案，移除不必要的信息和格式問題
+    
+    Args:
+        graph_answer: 原始的Graph答案
+        
+    Returns:
+        清理後的答案
+    """
+    import re
+    
+    # 移除 "(Year unknown)" 等無用信息
+    cleaned = re.sub(r'\(Year unknown\)', '', graph_answer)
+    cleaned = re.sub(r'\(year unknown\)', '', cleaned)
+    cleaned = re.sub(r'\(Unknown\)', '', cleaned)
+    
+    # 移除多餘的空格和空行
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    cleaned = re.sub(r'\n\s*\n\s*\n+', '\n\n', cleaned)
+    
+    # 修正標點符號後的空格
+    cleaned = re.sub(r'\s+([,。，、])', r'\1', cleaned)
+    
+    return cleaned.strip()
+
+
+def _generate_structured_answer(
+    query: str,
+    paper_ids: List[str],
+    layer2_docs: List[Any],
+    rag_system: Any
+) -> str:
+    """
+    生成結構化的詳細答案，避免直接暴露Context標記
+    
+    Args:
+        query: 用戶查詢
+        paper_ids: 相關論文ID列表
+        layer2_docs: Layer2檢索的文檔
+        rag_system: RAG系統實例
+        
+    Returns:
+        結構化的詳細答案
+    """
+    # 按paper_id分組chunks
+    papers_chunks = {}
+    for doc in layer2_docs:
+        paper_id = doc.metadata.get('paper_id', 'unknown')
+        title = doc.metadata.get('title', paper_id)
+        
+        if paper_id not in papers_chunks:
+            papers_chunks[paper_id] = {
+                'title': title,
+                'chunks': []
+            }
+        papers_chunks[paper_id]['chunks'].append(doc.page_content)
+    
+    # 檢測語言
+    def is_chinese(text: str) -> bool:
+        chinese_chars = sum(1 for char in text if '\u4e00' <= char <= '\u9fff')
+        return chinese_chars > len(text) * 0.3
+    
+    is_chinese_query = is_chinese(query)
+    
+    # 為每篇論文生成答案
+    paper_answers = []
+    for paper_id, data in papers_chunks.items():
+        title = data['title']
+        chunks_text = "\n\n".join(data['chunks'])
+        
+        # 構建prompt（不暴露Context標記）
+        if is_chinese_query:
+            prompt = f"""請根據以下論文內容回答問題。
+
+問題：{query}
+
+論文標題：{title}
+
+論文內容：
+{chunks_text}
+
+【重要指引】
+1. 請直接回答問題，不要提及"Context"或"背景資料"等字眼
+2. 使用繁體中文回答
+3. 如果論文中有具體數據（資料集、準確率、參數等），請明確列出
+4. 回答要結構化，使用列點或段落清楚呈現
+5. 如果內容中沒有相關資訊，請說明「論文中未詳細說明此部分」
+
+請針對「{title}」這篇論文回答："""
+        else:
+            prompt = f"""Based on the following paper content, answer the question.
+
+Question: {query}
+
+Paper Title: {title}
+
+Paper Content:
+{chunks_text}
+
+【Important Guidelines】
+1. Answer directly without mentioning "Context" or "background materials"
+2. If there are specific data (datasets, accuracy, parameters, etc.), list them clearly
+3. Structure your answer with bullet points or clear paragraphs
+4. If information is not available, state "This is not detailed in the paper"
+
+Please answer for the paper "{title}":"""
+        
+        try:
+            # 設定max_tokens避免截斷
+            answer = rag_system.llm.invoke(prompt)
+            paper_answers.append({
+                'title': title,
+                'answer': answer.strip()
+            })
+        except Exception as e:
+            logger.error(f"Failed to generate answer for {title}: {e}")
+            paper_answers.append({
+                'title': title,
+                'answer': f"生成答案時發生錯誤：{str(e)}"
+            })
+    
+    # 組合所有論文的答案
+    if is_chinese_query:
+        structured_answer = ""
+        for i, pa in enumerate(paper_answers, 1):
+            structured_answer += f"\n### 論文 {i}: {pa['title']}\n\n{pa['answer']}\n"
+    else:
+        structured_answer = ""
+        for i, pa in enumerate(paper_answers, 1):
+            structured_answer += f"\n### Paper {i}: {pa['title']}\n\n{pa['answer']}\n"
+    
+    return structured_answer.strip()
+
+
+def _format_final_answer(
+    graph_summary: str,
+    detailed_content: str,
+    paper_count: int
+) -> str:
+    """
+    格式化最終答案，提供清晰的結構
+    
+    Args:
+        graph_summary: Graph查詢的摘要
+        detailed_content: 詳細內容
+        paper_count: 論文數量
+        
+    Returns:
+        格式化的最終答案
+    """
+    # 檢測語言
+    def is_chinese(text: str) -> bool:
+        chinese_chars = sum(1 for char in text if '\u4e00' <= char <= '\u9fff')
+        return chinese_chars > len(text) * 0.3
+    
+    is_chinese_text = is_chinese(graph_summary + detailed_content)
+    
+    if is_chinese_text:
+        formatted = f"""📊 **摘要**
+
+{graph_summary}
+
+{'─' * 80}
+
+📝 **詳細說明** (共 {paper_count} 篇論文)
+
+{detailed_content}
+
+{'─' * 80}
+
+✓ 回答完成
+"""
+    else:
+        formatted = f"""📊 **Summary**
+
+{graph_summary}
+
+{'─' * 80}
+
+📝 **Detailed Information** ({paper_count} papers)
+
+{detailed_content}
+
+{'─' * 80}
+
+✓ Answer Complete
+"""
+    
+    return formatted
+
 
 # Create tools for the agent
 tools = [
@@ -412,33 +929,82 @@ Use the following format STRICTLY:
 Question: the input question you must answer
 Thought: you should always think about what to do
 Action: the action to take, should be exactly one of [{tool_names}]
-Action Input: the input to the action
+Action Input: the COMPLETE original question (DO NOT simplify, translate, or shorten)
 Observation: the result of the action
 ... (this Thought/Action/Action Input/Observation can repeat N times)
 Thought: I now know the final answer
 Final Answer: the final answer to the original input question
 
+CRITICAL: When providing Action Input:
+1. Copy the ENTIRE original question EXACTLY as asked
+2. Do NOT simplify or shorten the query
+3. Do NOT split complex queries into multiple actions
+4. PRESERVE all connecting words: "並且", "而且", "以及", "and", "also"
+5. PRESERVE all detail requests: "如何使用", "個別介紹", "how they use", "explain each"
+
+WRONG Examples:
+❌ Question: "哪些論文使用YOLO，並且他們如何使用" → Action Input: "哪些論文使用YOLO"  (WRONG - lost detail request)
+❌ Question: "哪些論文和智慧交通有關，並且個別介紹" → Action Input: "哪些論文和智慧交通有關"  (WRONG - lost "個別介紹")
+
+CORRECT Examples:
+✅ Question: "哪些論文使用YOLO，並且他們如何使用" → Action Input: "哪些論文使用YOLO，並且他們如何使用"  (CORRECT)
+✅ Question: "哪些論文和智慧交通有關，並且個別介紹" → Action Input: "哪些論文和智慧交通有關，並且個別介紹"  (CORRECT)
+
+CRITICAL: When you see "ANSWER READY:" in an Observation:
+1. IMMEDIATELY write "Thought: I now know the final answer"
+2. IMMEDIATELY write "Final Answer:" and copy EXACTLY EVERYTHING after "ANSWER READY:" (including ALL 📊摘要, 📝詳細說明, and all論文 details)
+3. Do NOT summarize, shorten, or modify ANY content
+4. Do NOT add your own commentary
+5. Include ALL sections, formatting, and separators
+6. Do NOT call any more actions
+
+EXAMPLE:
+Observation: 
+ANSWER READY:
+📊 **摘要**
+Content here with multiple papers...
+────────
+📝 **詳細說明** (共 5 篇論文)
+### Paper 1: ...
+### Paper 2: ...
+[All content]
+
+[This is the complete answer. Return it as your Final Answer NOW.]
+
+Thought: I now know the final answer
+Final Answer: 
+ANSWER READY:
+📊 **摘要**
+Content here with multiple papers...
+────────
+📝 **詳細說明** (共 5 篇論文)
+### Paper 1: ...
+### Paper 2: ...
+[All content]
+
 IMPORTANT ROUTING RULES:
 
-1. **AssistantCall** (Single Paper Detail Query):
-   - USE WHEN: User asks about content/details of ONE SPECIFIC paper.
-   - KEYWORDS: "this paper", "the paper about X", specific paper title, "what does paper X say", "explain X in paper", "methodology", "results", "dataset used in paper".
+1. **GraphAnalysisCall** (Cross-Paper Query) - CHECK THIS FIRST:
+   - USE WHEN: Query contains "Which papers", "哪些論文", "List all", "How many", "Compare".
+   - PRIORITY RULE: If query contains "Which papers" or "哪些論文", ALWAYS use GraphAnalysisCall.
+   - CRITICAL: GraphAnalysisCall handles BOTH finding papers AND getting details in one call.
+   - KEYWORDS: "Which papers...", "哪些論文", "List all...", "列出所有", "How many...", "多少", "Compare...", "比較", "papers that use X", "使用X的論文".
    - Examples: 
-     * "Summarize the paper about traffic flow prediction"
-     * "What methods does the LSTM paper use?"
-     * "Tell me about the dataset in the mango classification paper"
-     * "這篇關於交通流量預測的論文用什麼方法？"
-   - NOTE: AssistantCall will identify the specific paper, check if abstract is sufficient, then retrieve detailed chunks if needed.
+     * "Which papers use LSTM?" → GraphAnalysisCall (will return list only)
+     * "哪些論文用到YOLO，並且他們如何使用？" → GraphAnalysisCall (will find papers AND get details automatically)
+     * "哪些論文和智慧交通有關，並且個別介紹他們在做什麼" → GraphAnalysisCall (will find papers AND provide introductions automatically)
+     * "List all datasets" → GraphAnalysisCall
+     * "Compare research goals" → GraphAnalysisCall
+   - NOTE: GraphAnalysisCall is SMART - it automatically descends to Layer2 when the query requests details (e.g., "如何使用", "個別介紹", "並且").
 
-2. **GraphAnalysisCall** (Cross-Paper Query):
-   - USE WHEN: User asks about MULTIPLE papers, comparisons, or aggregations across papers.
-   - KEYWORDS: "Which papers...", "List all...", "How many...", "Compare...", "What are the common methods...", "papers that use X".
+2. **AssistantCall** (Single Paper Detail Query):
+   - USE WHEN: User asks about content/details of ONE SPECIFIC paper (NOT multiple papers).
+   - KEYWORDS: "this paper", "the paper about X", specific paper title, "what does paper X say", "explain X in paper".
    - Examples: 
-     * "Which papers use LSTM?"
-     * "List all datasets"
-     * "How many papers in Smart Transportation?"
-     * "Compare research goals across papers"
-     * "哪些論文用到集成式學習？"
+     * "Summarize the paper about traffic flow prediction" → AssistantCall
+     * "What methods does the LSTM paper use?" → AssistantCall
+     * "這篇關於交通流量預測的論文用什麼方法？" → AssistantCall
+   - NOTE: AssistantCall will identify the specific paper, check if abstract is sufficient, then retrieve detailed chunks if needed.
 
 3. **WebSearchCall**:
    - USE ONLY for explicit internet search requests.
@@ -478,18 +1044,52 @@ Question: Which papers use LSTM?
 Thought: This asks "which papers" use LSTM. This is a cross-paper query.
 Action: GraphAnalysisCall
 Action Input: Which papers use LSTM?
-Observation: [Knowledge Graph results: Paper1, Paper2, Paper5 use LSTM...]
-Thought: I now know the final answer
-Final Answer: Papers using LSTM include: 1) Traffic Flow Prediction (Paper1), 2) Time Series Analysis (Paper2)...
+Observation: ANSWER READY:
+Papers using LSTM: 
+1) Paper1 (Traffic Flow Prediction)
+2) Paper2 (Time Series Analysis)
+...
 
-Example 5 - Cross-Paper Aggregation (Use GraphAnalysisCall):
-Question: 哪些論文用到集成式學習？
-Thought: This asks "which papers" use ensemble learning. Cross-paper aggregation query.
-Action: GraphAnalysisCall
-Action Input: 哪些論文用到集成式學習？
-Observation: [Knowledge Graph: 基礎5_芒果分類, 論文8_農業AI...]
+[This is the complete answer. Return it as your Final Answer NOW.]
 Thought: I now know the final answer
-Final Answer: 使用集成式學習的論文包括：1) 基礎5_芒果分類 2) 論文8_農業AI...
+Final Answer: ANSWER READY:
+Papers using LSTM: 
+1) Paper1 (Traffic Flow Prediction)
+2) Paper2 (Time Series Analysis)
+...
+
+Example 5 - Cross-Paper Query with Detail Request (Use GraphAnalysisCall):
+Question: 哪些論文用到YOLO，並且他們如何使用？
+Thought: This asks "which papers" and requests details ("如何使用"). Use GraphAnalysisCall with COMPLETE query.
+Action: GraphAnalysisCall
+Action Input: 哪些論文用到YOLO，並且他們如何使用？
+Observation: ANSWER READY:
+📊 **摘要**
+使用 YOLO 的論文包括：論文1、論文2...
+
+────────────────────────────────────────────────────────────────────────────────
+📝 **詳細說明** (共 2 篇論文)
+
+### Paper 1: 論文1
+此論文使用 YOLO 進行物體偵測，採用 YOLOv3 架構...
+
+### Paper 2: 論文2
+此論文將 YOLO 應用於醫學影像分析，使用 YOLOv4...
+
+[This is the complete answer with all details. Return it as your Final Answer NOW.]
+Thought: I now know the final answer
+Final Answer: ANSWER READY:
+📊 **摘要**
+使用 YOLO 的論文包括：論文1、論文2...
+
+────────────────────────────────────────────────────────────────────────────────
+📝 **詳細說明** (共 2 篇論文)
+
+### Paper 1: 論文1
+此論文使用 YOLO 進行物體偵測，採用 YOLOv3 架構...
+
+### Paper 2: 論文2
+此論文將 YOLO 應用於醫學影像分析，使用 YOLOv4...
 
 Example 6 - Cross-Paper Comparison (Use GraphAnalysisCall):
 Question: Compare research goals in Smart Transportation domain
@@ -534,9 +1134,10 @@ Thought:{agent_scratchpad}"""
             tools=tools,
             verbose=True,
             handle_parsing_errors=True,
-            max_iterations=5,  # Allow multiple tool calls and reasoning steps
-            max_execution_time=60,  # Maximum 60 seconds per query
+            max_iterations=8,  # Increased to allow tool call + final answer generation
+            max_execution_time=120,  # Increased to 120 seconds for complex queries
             return_intermediate_steps=True
+            # Note: early_stopping_method removed as 'generate' is not supported
         )
         logger.info("Agent created successfully")
     except Exception as e:
