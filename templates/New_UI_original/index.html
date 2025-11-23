@@ -12,13 +12,13 @@
     <link href="https://fonts.googleapis.com/css2?family=Merriweather:wght@400;700&display=swap" rel="stylesheet">
     <!-- Font Awesome Icons -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+    <link rel="stylesheet" href="styles.css">
 </head>
 <body>
     <div class="header">
         <div class="header-content">
             <div>
-                <h1><i class="fas fa-robot"></i> AI Agent Router</h1>
+                <h1><i></i> AI Agent Router</h1>
                 <p class="subtitle"><i class="fas fa-sparkles"></i> Intelligent query routing and research lineage analysis powered by LangChain & Ollama</p>
             </div>
             <div style="display: flex; align-items: center; gap: 16px;">
@@ -39,7 +39,7 @@
             <div class="sidebar-section">
                 <div class="sidebar-title"><i class="fas fa-toolbox"></i> Available Tools</div>
                 <div class="function-list">
-                    <div class="function-item active" onclick="switchTab('general')">
+                    <div class="function-item" onclick="switchTab('general')">
                         <i class="fas fa-comments"></i>
                         <div class="function-name">General Assistant</div>
                     </div>
@@ -185,9 +185,6 @@
                     <button id="generalSubmitBtn" onclick="submitGeneralQuery()">
                         <i class="fas fa-paper-plane"></i> Send
                     </button>
-                    <button id="stopBtn" class="stop-btn" onclick="stopGeneration()">
-                        <i class="fas fa-stop"></i> Stop
-                    </button>
                 </div>
             </div>
 
@@ -205,6 +202,6 @@
         </div>
     </div>
 
-    <script src="{{ url_for('static', filename='js/script.js') }}"></script>
+    <script src="script.js"></script>
 </body>
 </html>

@@ -32,6 +32,14 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+# Flask Configuration
+app.config['SECRET_KEY'] = os.urandom(24)  # For session management
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB upload limit
+app.config['UPLOAD_FOLDER'] = './data/pdfs'  # PDF upload folder
+
+# Ensure upload folder exists
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
 # Initialize Ollama LLM for agent (Moved up for Graph RAG dependency)
 agent_llm = None
 try:
