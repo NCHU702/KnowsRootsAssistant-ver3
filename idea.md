@@ -4,6 +4,7 @@
 ---
 
 ### 1. 專案摘要 (Executive Summary)
+
 本專案旨在打造一套**「Agentic AI GraphRAG GenAI 平台」**。這是一套專為學術研究與企業內部知識管理設計的**本地端（Local）、低成本（Low-cost）、高隱私（Privacy-First）**解決方案。
 
 針對目前主流 RAG（檢索增強生成）技術面臨的「全域理解力不足」與「GraphRAG 建構成本過高」的兩難困境，本團隊開發了 **Local-GraphAgent**。我們創新地結合了 **Agentic AI（代理人工作流）** 與 **階層式圖學檢索（Hierarchical GraphRAG）**，並透過獨家的**高密度資訊切塊（High-Density Chunking）**技術，讓消費級硬體（如 Mac Mini M4）即可運行企業級的知識圖譜問答系統，實現「小模型，大智慧」的普惠 AI 願景。
