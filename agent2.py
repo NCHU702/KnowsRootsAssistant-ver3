@@ -63,7 +63,7 @@ rag_system = None
 
 try:
     rag_system = HierarchicalRAGSystem(
-        pdf_directory="./test_data",
+        pdf_directory="./data",
         model_name=model_name,
         embedding_model="quentinz/bge-large-zh-v1.5:latest",
         vectorstore_path="./vectorstore",   
