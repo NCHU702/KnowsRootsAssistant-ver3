@@ -63,7 +63,7 @@ rag_system = None
 
 try:
     rag_system = HierarchicalRAGSystem(
-        pdf_directory="./data",
+        pdf_directory="./test_data",
         model_name=model_name,
         embedding_model="quentinz/bge-large-zh-v1.5:latest",
         vectorstore_path="./vectorstore",   
@@ -120,7 +120,7 @@ try:
                 # 分塊策略：'naive' (傳統固定大小) 或 'summarization' (段落摘要)
                 'mode': os.getenv('CHUNKING_MODE', 'summarization'),  # 預設: naive (向後兼容)
                 'summarization': {
-                    'model': os.getenv('SUMMARIZATION_MODEL', 'llama3.2:latest'),  # 摘要使用的 LLM 
+                    'model': os.getenv('SUMMARIZATION_MODEL', 'llama3.2:1b'),  # 摘要使用的 LLM 
                     'section_parser': 'pymupdf_regex',  # PDF 段落解析方法
                     'min_sections': int(os.getenv('MIN_SECTIONS', '3')),  # 最少段落數
                     'map_reduce_threshold': int(os.getenv('MAP_REDUCE_THRESHOLD', '3000')),  # Map-Reduce 閾值
