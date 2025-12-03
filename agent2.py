@@ -67,8 +67,8 @@ try:
         model_name=model_name,
         embedding_model="quentinz/bge-large-zh-v1.5:latest",
         vectorstore_path="./vectorstore",   
-        chunk_size=800,
-        chunk_overlap=100,
+        chunk_size=1000,
+        chunk_overlap=150,
         config={
             'layer1': {
                 'k_documents': int(os.getenv('LAYER1_K_DOCUMENTS', '10')),
@@ -122,9 +122,9 @@ try:
                 'summarization': {
                     'model': os.getenv('SUMMARIZATION_MODEL', 'llama3.2:latest'),  # 摘要使用的 LLM 
                     'section_parser': 'pymupdf_regex',  # PDF 段落解析方法
-                    'min_sections': int(os.getenv('MIN_SECTIONS', '3')),  # 最少段落數
-                    'map_reduce_threshold': int(os.getenv('MAP_REDUCE_THRESHOLD', '3000')),  # Map-Reduce 閾值
-                    'target_summary_length': int(os.getenv('TARGET_SUMMARY_LENGTH', '300')),  # 目標摘要長度
+                    'min_sections': int(os.getenv('MIN_SECTIONS', '2')),  # 最少段落數
+                    'map_reduce_threshold': int(os.getenv('MAP_REDUCE_THRESHOLD', '2500')),  # Map-Reduce 閾值
+                    'target_summary_length': int(os.getenv('TARGET_SUMMARY_LENGTH', '500')),  # 目標摘要長度
                     'ollama_base_url': 'http://localhost:11434',
                     'store_original': False  # 是否存儲原始文本
                 }
