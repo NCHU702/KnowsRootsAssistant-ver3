@@ -1,0 +1,226 @@
+{
+  "_metadata": {
+    "description": "Benchmark Ground Truth: KnowsRoots Graph vs Traditional RAG",
+    "version": "2.0",
+    "created": "2026-02-24 15:16:06",
+    "source": "Live Neo4j (bolt://localhost:7687) — queried directly for exact consistency",
+    "total_papers_in_graph": 24,
+    "total_queries": 10,
+    "notes": "paper_id 直接從 Neo4j 讀取，確保與 benchmark Cypher 查詢完全一致。"
+  },
+  "queries": [
+    {
+      "query_id": "Q01",
+      "query_text": "哪些論文和醫療相關？",
+      "query_type": "domain",
+      "graph_filter": {
+        "relationship": "APPLIED_IN",
+        "target_node": "Domain",
+        "target_value": "Healthcare"
+      },
+      "cypher": "MATCH (p:Paper)-[:APPLIED_IN]->(d:Domain {name: 'Healthcare'}) RETURN p.paper_id",
+      "ground_truth_paper_ids": [
+        "基於深度學習之鼻咽癌腫塊辨識_20251106_144224",
+        "基礎3_基於深度學習之鼻咽癌腫塊辨識",
+        "基礎4_應用混合式深度學習開發適應於小資料集之鼻咽癌分類模型",
+        "標準4_利用RBF-DNN配合醫院病患人流資料探究"
+      ],
+      "difficulty": "medium",
+      "notes": "RAG 挑戰：鼻咽癌論文摘要未必包含「醫療」二字",
+      "expected_count": 4
+    },
+    {
+      "query_id": "Q02",
+      "query_text": "哪些論文和智慧交通相關？",
+      "query_type": "domain",
+      "graph_filter": {
+        "relationship": "APPLIED_IN",
+        "target_node": "Domain",
+        "target_value": "Smart Transportation"
+      },
+      "cypher": "MATCH (p:Paper)-[:APPLIED_IN]->(d:Domain {name: 'Smart Transportation'}) RETURN p.paper_id",
+      "ground_truth_paper_ids": [
+        "基礎1_以純Youbike資料識別Covid-19對臺北市區活動的影響_20220219",
+        "基礎7_基於模糊類神經網路的路網旅行時間預測方法",
+        "查詢2_天際線查詢應用於具時間限制之多需求路徑規劃",
+        "查詢3_近似巡訪天際線路徑查詢",
+        "標準11_應用補償式遷移學習模型於區域人流之強健性預測",
+        "標準14_基於集成式生成對抗網路進行人流異常預測",
+        "標準15_基於CycleGAN和特徵融合於挑戰性場景的車道偵測",
+        "標準1_基於卷積類神經網路之澳門公車軌跡辨識",
+        "標準2_基於人流資料、土地使用分區圖以及Google趨勢資料進行捷運進出站人數預測-以台北捷運為例",
+        "標準7_使用深度學習模型結合二維高斯函數探討交通站點之用量與成因"
+      ],
+      "difficulty": "hard",
+      "notes": "RAG 挑戰：「天際線查詢」「YouBike」「澳門公車」的摘要可能不直接包含「交通」關鍵字",
+      "expected_count": 10
+    },
+    {
+      "query_id": "Q03",
+      "query_text": "哪些論文和環境監測相關？",
+      "query_type": "domain",
+      "graph_filter": {
+        "relationship": "APPLIED_IN",
+        "target_node": "Domain",
+        "target_value": "Environmental Monitoring"
+      },
+      "cypher": "MATCH (p:Paper)-[:APPLIED_IN]->(d:Domain {name: 'Environmental Monitoring'}) RETURN p.paper_id",
+      "ground_truth_paper_ids": [
+        "標準3_基於類神經網路之區域PM2.5預測",
+        "標準9_應用三維高斯函數結合深度學習之區域 PM2.5 預測"
+      ],
+      "difficulty": "easy",
+      "notes": "只有少量論文，RAG 可能額外找到標準3（PM2.5，但不在 Graph 中）",
+      "expected_count": 2
+    },
+    {
+      "query_id": "Q04",
+      "query_text": "哪些論文和觀光旅遊相關？",
+      "query_type": "domain",
+      "graph_filter": {
+        "relationship": "APPLIED_IN",
+        "target_node": "Domain",
+        "target_value": "Tourism"
+      },
+      "cypher": "MATCH (p:Paper)-[:APPLIED_IN]->(d:Domain {name: 'Tourism'}) RETURN p.paper_id",
+      "ground_truth_paper_ids": [
+        "基礎2_基於社群網路資料之旅遊區辨識",
+        "標準16_基於自動編碼器與條件生成對抗網路之旅程推薦應用"
+      ],
+      "difficulty": "medium",
+      "notes": "RAG 挑戰：「旅程推薦」和「旅遊區辨識」語義接近旅遊，但摘要可能偏向技術描述",
+      "expected_count": 2
+    },
+    {
+      "query_id": "Q05",
+      "query_text": "哪些論文使用CNN？",
+      "query_type": "method",
+      "graph_filter": {
+        "relationship": "USES_METHOD",
+        "target_node": "Method",
+        "target_value": "CNN"
+      },
+      "cypher": "MATCH (p:Paper)-[:USES_METHOD]->(m:Method {name: 'CNN'}) RETURN p.paper_id",
+      "ground_truth_paper_ids": [
+        "基於深度學習之鼻咽癌腫塊辨識_20251106_144224",
+        "基礎10_利用生成對抗網路產生模擬資料以提昇刀具磨耗預測之準確率",
+        "基礎3_基於深度學習之鼻咽癌腫塊辨識",
+        "基礎4_應用混合式深度學習開發適應於小資料集之鼻咽癌分類模型",
+        "基礎9_基於生成對抗網路設計循環風扇控制系統以進行冷氣房之微空間溫度調整",
+        "查詢2_天際線查詢應用於具時間限制之多需求路徑規劃",
+        "查詢3_近似巡訪天際線路徑查詢",
+        "標準11_應用補償式遷移學習模型於區域人流之強健性預測",
+        "標準1_基於卷積類神經網路之澳門公車軌跡辨識",
+        "標準7_使用深度學習模型結合二維高斯函數探討交通站點之用量與成因"
+      ],
+      "difficulty": "hard",
+      "notes": "部分論文用 CNN 做前處理而非主模型。Graph 另有「卷積神經網路」「3D-CNN」為獨立節點",
+      "expected_count": 10
+    },
+    {
+      "query_id": "Q06",
+      "query_text": "哪些論文使用LSTM？",
+      "query_type": "method",
+      "graph_filter": {
+        "relationship": "USES_METHOD",
+        "target_node": "Method",
+        "target_value": "LSTM"
+      },
+      "cypher": "MATCH (p:Paper)-[:USES_METHOD]->(m:Method {name: 'LSTM'}) RETURN p.paper_id",
+      "ground_truth_paper_ids": [
+        "基礎4_應用混合式深度學習開發適應於小資料集之鼻咽癌分類模型",
+        "基礎9_基於生成對抗網路設計循環風扇控制系統以進行冷氣房之微空間溫度調整",
+        "查詢2_天際線查詢應用於具時間限制之多需求路徑規劃",
+        "查詢3_近似巡訪天際線路徑查詢",
+        "標準11_應用補償式遷移學習模型於區域人流之強健性預測",
+        "標準7_使用深度學習模型結合二維高斯函數探討交通站點之用量與成因"
+      ],
+      "difficulty": "medium",
+      "notes": "Graph 另有「mRBF-LSTM」為獨立節點，不包含在 LSTM 節點中",
+      "expected_count": 6
+    },
+    {
+      "query_id": "Q07",
+      "query_text": "哪些論文使用YOLO？",
+      "query_type": "method",
+      "graph_filter": {
+        "relationship": "USES_METHOD",
+        "target_node": "Method",
+        "target_value": "YOLO"
+      },
+      "cypher": "MATCH (p:Paper)-[:USES_METHOD]->(m:Method {name: 'YOLO'}) RETURN p.paper_id",
+      "ground_truth_paper_ids": [
+        "基於深度學習之鼻咽癌腫塊辨識_20251106_144224",
+        "基礎3_基於深度學習之鼻咽癌腫塊辨識"
+      ],
+      "difficulty": "medium",
+      "notes": "Graph 另有「YOLO-v5」為獨立節點，不包含在 YOLO 節點中",
+      "expected_count": 2
+    },
+    {
+      "query_id": "Q08",
+      "query_text": "哪些論文使用Ensemble Learning？",
+      "query_type": "method",
+      "graph_filter": {
+        "relationship": "USES_METHOD",
+        "target_node": "Method",
+        "target_value": "Ensemble Learning"
+      },
+      "cypher": "MATCH (p:Paper)-[:USES_METHOD]->(m:Method {name: 'Ensemble Learning'}) RETURN p.paper_id",
+      "ground_truth_paper_ids": [
+        "基於深度學習之鼻咽癌腫塊辨識_20251106_144224",
+        "基礎10_利用生成對抗網路產生模擬資料以提昇刀具磨耗預測之準確率",
+        "基礎3_基於深度學習之鼻咽癌腫塊辨識",
+        "標準14_基於集成式生成對抗網路進行人流異常預測"
+      ],
+      "difficulty": "medium",
+      "notes": "Graph 另有「集成式學習」為獨立中文節點，不包含在此英文節點中",
+      "expected_count": 4
+    },
+    {
+      "query_id": "Q09",
+      "query_text": "哪些醫療相關的論文使用CNN？",
+      "query_type": "composite",
+      "graph_filter": {
+        "relationship_1": "APPLIED_IN",
+        "target_node_1": "Domain",
+        "target_value_1": "Healthcare",
+        "relationship_2": "USES_METHOD",
+        "target_node_2": "Method",
+        "target_value_2": "CNN"
+      },
+      "cypher": "MATCH (p:Paper)-[:APPLIED_IN]->(d:Domain {name: 'Healthcare'}) WHERE (p)-[:USES_METHOD]->(:Method {name: 'CNN'}) RETURN p.paper_id",
+      "ground_truth_paper_ids": [
+        "基於深度學習之鼻咽癌腫塊辨識_20251106_144224",
+        "基礎3_基於深度學習之鼻咽癌腫塊辨識",
+        "基礎4_應用混合式深度學習開發適應於小資料集之鼻咽癌分類模型"
+      ],
+      "difficulty": "hard",
+      "notes": "Healthcare ∩ CNN。RAG 無法做交集運算，這是最大弱點。",
+      "expected_count": 3
+    },
+    {
+      "query_id": "Q10",
+      "query_text": "哪些智慧交通相關的論文使用LSTM？",
+      "query_type": "composite",
+      "graph_filter": {
+        "relationship_1": "APPLIED_IN",
+        "target_node_1": "Domain",
+        "target_value_1": "Smart Transportation",
+        "relationship_2": "USES_METHOD",
+        "target_node_2": "Method",
+        "target_value_2": "LSTM"
+      },
+      "cypher": "MATCH (p:Paper)-[:APPLIED_IN]->(d:Domain {name: 'Smart Transportation'}) WHERE (p)-[:USES_METHOD]->(:Method {name: 'LSTM'}) RETURN p.paper_id",
+      "ground_truth_paper_ids": [
+        "查詢2_天際線查詢應用於具時間限制之多需求路徑規劃",
+        "查詢3_近似巡訪天際線路徑查詢",
+        "標準11_應用補償式遷移學習模型於區域人流之強健性預測",
+        "標準7_使用深度學習模型結合二維高斯函數探討交通站點之用量與成因"
+      ],
+      "difficulty": "hard",
+      "notes": "Smart Transportation ∩ LSTM。RAG 無法做交集運算。",
+      "expected_count": 4
+    }
+  ]
+}
